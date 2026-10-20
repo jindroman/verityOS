@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# verityfetch — Verity OS system info
+Y=$'\e[38;5;220m'; D=$'\e[2m'; N=$'\e[0m'
+LOGO=/usr/share/verity/logo.txt
+
+name="Verity OS"
+[[ -r /etc/os-release ]] && name="$(. /etc/os-release; echo "${PRETTY_NAME:-$NAME}")"
+host="$(cat /etc/hostname 2>/dev/null || echo verity)"
+user="${USER:-$(id -un)}"
+cols="$(tput cols 2>/dev/null || echo 80)"
+
+if [[ -r $LOGO && "$cols" -ge 72 && "${1:-}" != "--no-logo" ]]; then
+  printf '%s%s%s\n\n' "$Y" "$(cat "$LOGO")" "$N"
+fi
+
+id="$user@$host"
+printf '%s%s%s\n' "$Y" "$id" "$N"
+printf '%*s\n' "${#id}" '' | sed 's/ /─/g'
+row() { printf '%s%-11s%s %s\n' "$Y" "$1" "$N" "$2"; }
+
+row "OS"        "$name"
+row "Kernel"    "$(uname -r)"
+row "Desktop"   "${XDG_CURRENT_DESKTOP:-none (tty)}"
+row "Shell"     "$(basename "${SHELL:-sh}")"
+row "Uptime"    "$(uptime -p 2>/dev/null | sed 's/^up //')"
+command -v pacman >/dev/null 2>&1 && row "Packages" "$(pacman -Qq 2>/dev/null | wc -l)"
+row "Assistant" "Verity AI ${D}(coming soon)${N}"

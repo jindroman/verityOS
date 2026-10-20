@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# verity — a friendlier front-end for pacman (Verity OS)
+# Draft v0.3: wraps pacman/snapper. Does NOT replace the Arch package ecosystem.
+set -uo pipefail
+
+VERSION="0.3.0-dev"
+Y=$'\e[38;5;220m'; G=$'\e[32m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
+say()  { printf '%sverity%s %s\n' "$Y" "$N" "$*"; }
+ok()   { printf ' %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf ' %s⚠%s %s\n' "$Y" "$N" "$*"; }
+bad()  { printf ' %s✗%s %s\n' "$R" "$N" "$*"; }
+
+CMD="${1:-help}"; shift || true
+
+need_root() {
+  if [[ $EUID -ne 0 ]]; then
+    say "that needs root — try: sudo verity $CMD $*"
+    exit 1
+  fi
+}
+
+have_snapper() {
+  command -v snapper >/dev/null 2>&1 && snapper list-configs 2>/dev/null | grep -q '^root'
+}
+
+snapshot() {
+  if have_snapper; then
+    echo "Creating snapshot..."
+    if snapper -c root create --cleanup-algorithm number -d "$1" >/dev/null 2>&1; then
+      ok "Snapshot created"
+    else
+      warn "Snapshot failed — continuing without one"
+    fi
+  else
+    warn "Snapshots aren't set up on this system (needs btrfs + snapper) — continuing without one"
+  fi
+}
+
+cmd_install() {
+  need_root "$@"
+  [[ $# -gt 0 ]] || { say "usage: sudo verity install <package...>"; exit 1; }
+  snapshot "verity: before install $*"
+  if ! pacman -S --needed "$@"; then
+    echo; say "couldn't install that. Try: verity search ${1}"; exit 1
+  fi
+  echo; ok "Done."
+}
+
+cmd_remove() {
+  need_root "$@"
+  [[ $# -gt 0 ]] || { say "usage: sudo verity remove <package...>"; exit 1; }
+  snapshot "verity: before remove $*"
+  pacman -Rns "$@" && { echo; ok "Removed."; }
+}
+
+cmd_update() {
+  need_root "$@"
+  snapshot "verity: before system update"
+  echo; echo "Updating system..."
+  if pacman -Syu; then
+    echo; ok "Packages updated"
+    say "Verity OS has been updated successfully."
+  else
+    echo; bad "Update failed. If something broke, try: sudo verity rollback"; exit 1
+  fi
+}
+
+cmd_search() {
+  [[ $# -gt 0 ]] || { say "usage: verity search <term>"; exit 1; }
+  pacman -Ss "$@"
+}
+
+cmd_history() {
+  local n="${1:-30}"
+  [[ -r /var/log/pacman.log ]] || { say "no pacman log found"; exit 1; }
+  grep -E '\[ALPM\] (installed|removed|upgraded|downgraded) ' /var/log/pacman.log \
+    | tail -n "$n" \
+    | sed -E 's/^\[([^]]+)\] \[ALPM\] /\1  /'
+}
+
+cmd_clean() {
+  need_root "$@"
+  say "cleaning package cache…"
+  if command -v paccache >/dev/null 2>&1; then
+    paccache -rk2
+    paccache -ruk0
+  else
+    pacman -Sc
+  fi
+  local orphans; orphans="$(pacman -Qdtq 2>/dev/null || true)"
+  if [[ -n "$orphans" ]]; then
+    echo; say "unused dependencies found:"; echo "$orphans" | sed 's/^/   /'
+    read -r -p "Remove them? [y/N] " a
+    [[ "$a" =~ ^[Yy]$ ]] && pacman -Rns $orphans
+  else
+    ok "No unused dependencies"
+  fi
+}
+
+cmd_rollback() {
+  need_root "$@"
+  have_snapper || { bad "No snapshots available (needs btrfs + snapper set up by the installer)."; exit 1; }
+  say "rollback is EXPERIMENTAL in this draft. Available snapshots:"; echo
+  snapper -c root list
+  echo
+  read -r -p "Snapshot number to roll back to (blank = cancel): " num
+  [[ -n "$num" ]] || { say "cancelled."; exit 0; }
+  [[ "$num" =~ ^[0-9]+$ ]] || { bad "that's not a number."; exit 1; }
+  read -r -p "Roll back to snapshot $num and reboot afterwards? [y/N] " a
+  [[ "$a" =~ ^[Yy]$ ]] || { say "cancelled."; exit 0; }
+  snapper -c root rollback "$num" && ok "Rollback prepared — reboot to finish: sudo reboot"
+}
+
+cmd_doctor() {
+  local problems=0 live=0
+  [[ -d /run/archiso ]] && live=1
+  say "running diagnostics…"; echo
+
+  ok "Kernel $(uname -r)"
+
+  if ip route show default 2>/dev/null | grep -q default; then
+    if getent hosts archlinux.org >/dev/null 2>&1; then ok "Network (online, DNS works)"
+    else warn "Network: connected, but DNS lookup failed"; problems=$((problems+1)); fi
+  else warn "Network: no default route"; problems=$((problems+1)); fi
+
+  if [[ -s /proc/asound/cards ]] && ! grep -qi 'no soundcards' /proc/asound/cards; then ok "Audio device found"
+  else warn "Audio: no sound card detected"; problems=$((problems+1)); fi
+
+  if command -v lspci >/dev/null 2>&1; then
+    local gpu; gpu="$(lspci 2>/dev/null | grep -Ei 'vga|3d controller|display controller' | head -1 | cut -d: -f3- | sed 's/^ *//')"
+    if [[ -n "$gpu" ]]; then ok "GPU: $gpu"; else warn "GPU: none detected"; problems=$((problems+1)); fi
+  else
+    warn "GPU: pciutils not installed (sudo verity install pciutils)"
+  fi
+
+  if [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then ok "Desktop: $XDG_CURRENT_DESKTOP"
+  elif systemctl is-enabled sddm >/dev/null 2>&1; then ok "Desktop: SDDM login manager enabled"
+  elif (( live )); then ok "Desktop: n/a (live installer)"
+  else warn "Desktop: no graphical session or login manager found"; fi
+
+  if command -v pacman >/dev/null 2>&1; then
+    if pacman -Dk >/dev/null 2>&1; then ok "Package database"
+    else warn "Package database has problems (run: pacman -Dk)"; problems=$((problems+1)); fi
+  fi
+
+  local failed; failed="$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)"
+  if [[ "$failed" -eq 0 ]]; then ok "System services"
+  else warn "System services: $failed failed (run: systemctl --failed)"; problems=$((problems+1)); fi
+
+  local use; use="$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')"
+  if [[ -n "$use" && "$use" -ge 90 ]]; then warn "Disk: / is ${use}% full (try: sudo verity clean)"; problems=$((problems+1))
+  else ok "Disk space"; fi
+
+  if (( ! live )); then
+    if have_snapper; then ok "Snapshots configured"
+    else warn "Snapshots not configured (rollback unavailable)"; fi
+  fi
+
+  echo
+  if [[ $problems -eq 0 ]]; then ok "All good."
+  else warn "$problems problem$([[ $problems -gt 1 ]] && echo s) detected"
+       echo "${D}   (Explaining and fixing problems automatically is a planned Verity AI feature.)${N}"; fi
+}
+
+cmd_ask() {
+  say "Verity AI isn't built yet — this command is a placeholder."
+  echo "  You asked: $*"
+  echo "  For now: verity doctor | verity search <term> | verity help"
+}
+
+cmd_help() {
+  cat <<HELP
+${Y}Verity OS${N} — package & system helper  (v$VERSION)
+
+  sudo verity install <pkg...>   install packages (snapshot first, if available)
+  sudo verity remove  <pkg...>   remove packages and unused deps
+  sudo verity update             update the whole system (snapshot first)
+  verity search <term>           search the repositories
+  verity history [N]             last N package changes (default 30)
+  sudo verity clean              clear package cache, offer to remove orphans
+  sudo verity rollback           restore a snapshot (experimental)
+  verity doctor                  check kernel, network, audio, GPU, services…
+  verity ask "<question>"        placeholder for the future Verity AI
+
+Verity is a thin layer on top of pacman — pacman still works as normal.
+HELP
+}
+
+case "$CMD" in
+  install)        cmd_install "$@" ;;
+  remove|uninstall) cmd_remove "$@" ;;
+  update|upgrade) cmd_update "$@" ;;
+  search)         cmd_search "$@" ;;
+  history)        cmd_history "$@" ;;
+  clean)          cmd_clean "$@" ;;
+  rollback)       cmd_rollback "$@" ;;
+  doctor)         cmd_doctor ;;
+  ask)            cmd_ask "$@" ;;
+  version|-v|--version) echo "verity $VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *) say "unknown command: $CMD"; echo; cmd_help; exit 1 ;;
+esac

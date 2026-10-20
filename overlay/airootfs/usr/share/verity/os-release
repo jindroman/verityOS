@@ -1,0 +1,9 @@
+NAME="Verity OS"
+PRETTY_NAME="Verity OS"
+ID=verityos
+ID_LIKE=arch
+BUILD_ID=rolling
+VERSION_ID=0.3.0-dev
+ANSI_COLOR="38;5;220"
+HOME_URL="https://github.com/verityos/verityOS"
+LOGO=verityos

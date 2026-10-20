@@ -1,0 +1,5 @@
+out/
+work/
+profile/
+*.iso
+*.qcow2

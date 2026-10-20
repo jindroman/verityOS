@@ -1,0 +1,15 @@
+# Extra packages added to the Arch "releng" live ISO
+dialog
+gptfdisk
+parted
+btrfs-progs
+dosfstools
+efibootmgr
+grub
+snapper
+pacman-contrib
+pciutils
+zsh
+git
+nano
+curl

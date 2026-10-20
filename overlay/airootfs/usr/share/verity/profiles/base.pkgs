@@ -1,0 +1,14 @@
+base
+linux
+linux-firmware
+btrfs-progs
+grub
+networkmanager
+sudo
+zsh
+git
+nano
+man-db
+pacman-contrib
+pciutils
+snapper

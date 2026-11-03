@@ -9,21 +9,20 @@ set -euo pipefail
 log()  { echo "[verity-setup-desktop] $*"; }
 die()  { echo "[verity-setup-desktop] ERROR: $*" >&2; exit 1; }
 
+LIST_ONLY=0
+if [[ "${1:-}" == "--list" ]]; then LIST_ONLY=1; shift; fi
+
 PROFILE="${1:-}"
 USERNAME="${2:-}"
 AUTOLOGIN=0
 [[ "${3:-}" == "--autologin" ]] && AUTOLOGIN=1
 
-[[ $EUID -eq 0 ]] || die "must run as root (inside the installed system)"
-
 case "$PROFILE" in
   hypr|hyprland)            PROFILE=hypr ;;
   kde|plasma|desktop)       PROFILE=kde ;;
-  none|terminal|tty|"")     log "terminal-only profile, nothing to do"; exit 0 ;;
+  none|terminal|tty|"")     [[ $LIST_ONLY -eq 1 ]] && exit 0; log "terminal-only profile, nothing to do"; exit 0 ;;
   *) die "unknown profile '$PROFILE' (use hypr, kde or none)" ;;
 esac
-
-id "$USERNAME" &>/dev/null || die "user '$USERNAME' does not exist yet; create it before running this"
 
 COMMON=(sddm networkmanager mesa xorg-xwayland pipewire pipewire-pulse wireplumber
         xdg-user-dirs noto-fonts ttf-dejavu qt5-wayland qt6-wayland python)
@@ -39,6 +38,12 @@ else
   SESSION_FILE="plasma.desktop"
   SESSION_PATH="/usr/share/wayland-sessions/plasma.desktop"
 fi
+
+# --list: just print the package names (used by verity-install for sizing)
+if [[ $LIST_ONLY -eq 1 ]]; then printf '%s\n' "${PKGS[@]}"; exit 0; fi
+
+[[ $EUID -eq 0 ]] || die "must run as root (inside the installed system)"
+id "$USERNAME" &>/dev/null || die "user '$USERNAME' does not exist yet; create it before running this"
 
 log "installing packages for profile: $PROFILE"
 pacman -S --needed --noconfirm "${PKGS[@]}"

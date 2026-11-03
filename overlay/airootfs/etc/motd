@@ -1,7 +1,7 @@
 
-  🟡 Verity OS — Linux, but it talks back.
+ Welcome to Verity OS.
 
-  Install to disk :  verity-install
-  System info     :  verityfetch
-  Need Wi-Fi?     :  iwctl     (then: station wlan0 connect <name>)
+   Install to disk ......  sudo verity-install
+   Ask the AI helper ....  verity ask "how do I connect to wifi?"
+   System info ..........  verityfetch
 

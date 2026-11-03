@@ -1,222 +1,609 @@
 #!/usr/bin/env bash
-# verity-install — Verity OS installer (DRAFT, untested on real hardware)
+# verity-install - the Verity OS installer
 #
-# Erases ONE whole disk, then installs Arch base + Verity tools + a desktop.
-# Layout: GPT, btrfs (@, @home, @snapshots, @log). UEFI: 1 GiB ESP at /boot. BIOS: bios_boot part.
+#   sudo verity-install            install Verity OS to a disk
+#   sudo verity-install --dry-run  ask everything, change nothing
 #
-#   verity-install            interactive install
-#   verity-install --dry-run  walk through the menus, print commands, change nothing
+# Log: /tmp/verity-install.log
 set -uo pipefail
 
-VERSION="0.3.0-dev"
-SHARE="${VERITY_SHARE:-/usr/share/verity}"
+VERSION="0.4.0"
 LOG=/tmp/verity-install.log
-TITLE="Verity OS Installer $VERSION"
-DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
+MNT=/mnt
+DRY=0
+TOTAL_STEPS=7
+START=$SECONDS
 
-: > "$LOG"
+if [[ -t 1 ]]; then
+  Y=$'\e[1;33m'; G=$'\e[1;32m'; R=$'\e[1;31m'; D=$'\e[2m'; B=$'\e[1m'; N=$'\e[0m'
+else
+  Y=""; G=""; R=""; D=""; B=""; N=""
+fi
 
-die() { clear; echo "verity-install: $*" >&2; echo "Log: $LOG" >&2; exit 1; }
-msg() { dialog --title "$TITLE" --msgbox "$1" "${2:-10}" "${3:-64}"; }
-run() {
-  echo "+ $*" >> "$LOG"
-  if (( DRY )); then echo "[dry-run] $*" >> "$LOG"; return 0; fi
-  "$@" >> "$LOG" 2>&1 || die "command failed: $*"
+# ------------------------------------------------------------------ ui helpers
+usage() {
+  cat <<EOF
+Verity OS installer $VERSION
+
+Usage: sudo verity-install [--dry-run] [--help]
+
+  --dry-run   ask every question and show what would happen, but change nothing
+EOF
+  exit 0
 }
 
-# ---------- preflight ----------
-[[ $EUID -eq 0 ]] || die "run as root (you're on the live ISO: it already is)."
-command -v dialog >/dev/null || die "dialog is missing."
-for t in sgdisk mkfs.btrfs mkfs.fat pacstrap genfstab arch-chroot; do
-  command -v "$t" >/dev/null || die "missing tool: $t"
-done
+banner() {
+  clear 2>/dev/null || true
+  printf '%s' "$Y"
+  cat <<'EOF'
 
-[[ -d /sys/firmware/efi ]] && MODE=uefi || MODE=bios
+ ╦  ╦╔═╗╦═╗╦╔╦╗╦ ╦  ╔═╗╔═╗
+ ╚╗╔╝║╣ ╠╦╝║ ║ ╚╦╝  ║ ║╚═╗
+  ╚╝ ╚═╝╩╚═╩ ╩  ╩   ╚═╝╚═╝
+EOF
+  printf '%s  installer %s%s\n\n' "$N$D" "$VERSION" "$N"
+}
 
-if (( ! DRY )) && ! ping -c1 -W4 archlinux.org >/dev/null 2>&1; then
-  msg "No internet connection.\n\nVerity OS downloads its packages during install.\n\nEthernet: just plug in.\nWi-Fi: run  iwctl  then  station wlan0 connect <name>\n\nThen run verity-install again." 14
-  clear; exit 1
-fi
+say()  { printf '%s\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+step() { printf '\n%s[%s/%s]%s %s%s%s\n' "$Y" "$1" "$TOTAL_STEPS" "$N" "$B" "$2" "$N"; }
 
-dialog --title "$TITLE" --yesno "Welcome to Verity OS.\n\nThis is an EARLY DRAFT installer. It will ERASE one entire disk.\nDo not use it on a machine with data you care about — try it in a VM first.\n\nBoot mode detected: ${MODE^^}\n\nContinue?" 15 66 || { clear; exit 0; }
+die() {
+  printf '\n  %s✗ %s%s\n' "$R" "$*" "$N" >&2
+  if [[ -s $LOG ]]; then
+    printf '  %sLast log lines (%s):%s\n' "$D" "$LOG" "$N" >&2
+    tail -n 12 "$LOG" | sed 's/^/    /' >&2
+  fi
+  exit 1
+}
 
-# ---------- choose disk (hide the live USB) ----------
-LIVE_DEV=""
-if src="$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null)" && [[ -n "$src" ]]; then
-  LIVE_DEV="/dev/$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)"
-fi
-opts=()
-while read -r name size model; do
-  [[ "$name" == "$LIVE_DEV" ]] && continue
-  [[ "$size" == "0B" || "$name" == /dev/zram* ]] && continue
-  opts+=("$name" "$size  ${model:-disk}")
-done < <(lsblk -dpno NAME,SIZE,MODEL -e 2,7,11)
-[[ ${#opts[@]} -gt 0 ]] || die "no installable disks found."
+ask() { # ask VAR "prompt" [default]
+  local __v=$1 prompt=$2 def=${3:-} ans
+  if [[ -n $def ]]; then
+    read -rp "  $prompt [$def]: " ans || die "Input closed, aborting."
+    ans=${ans:-$def}
+  else
+    read -rp "  $prompt: " ans || die "Input closed, aborting."
+  fi
+  printf -v "$__v" '%s' "$ans"
+}
 
-DISK="$(dialog --stdout --title "$TITLE" --menu "Install Verity OS on which disk?\n(the ENTIRE disk will be erased)" 18 66 8 "${opts[@]}")" || { clear; exit 0; }
+confirm() { local a; read -rp "  $1 [Y/n] " a || return 1; [[ -z $a || $a =~ ^[Yy] ]]; }
 
-typed="$(dialog --stdout --title "$TITLE" --inputbox "ALL DATA on $DISK will be destroyed.\n\nType the disk path ($DISK) to confirm:" 11 66 "")" || { clear; exit 0; }
-[[ "$typed" == "$DISK" ]] || { msg "Didn't match — nothing was changed." 7; clear; exit 0; }
+fmt_bytes() {
+  awk -v b="${1:-0}" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GB", b/1073741824;
+    else if (b >= 1048576) printf "%.0f MB", b/1048576;
+    else printf "%.0f KB", b/1024 }'
+}
 
-# ---------- choose experience ----------
-PROFILE="$(dialog --stdout --title "$TITLE" --menu "Choose your Verity experience:" 14 72 3 \
-  hypr "Verity Hypr     — Hyprland: minimal, fast, keyboard-driven" \
-  kde  "Verity Desktop  — KDE Plasma: familiar, great for everyday use" \
-  none "Terminal only   — no desktop")" || { clear; exit 0; }
+fmt_time() {
+  local s=${1:-0}
+  if   (( s >= 3600 )); then printf '%dh %02dm' $((s/3600)) $((s%3600/60))
+  elif (( s >= 60 ));   then printf '%d min' $(( (s+59)/60 ))
+  else                       printf '%d sec' "$s"; fi
+}
 
-# ---------- system settings ----------
-HOSTNAME_="$(dialog --stdout --title "$TITLE" --inputbox "Computer name:" 8 50 "verity")" || exit 0
-USERNAME="$(dialog --stdout --title "$TITLE" --inputbox "Your username (lowercase letters/digits):" 8 50 "")" || exit 0
-[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "invalid username."
-while :; do
-  PW1="$(dialog --stdout --insecure --passwordbox "Password for $USERNAME:" 8 50)" || exit 0
-  PW2="$(dialog --stdout --insecure --passwordbox "Repeat password:" 8 50)" || exit 0
-  [[ -n "$PW1" && "$PW1" == "$PW2" ]] && break
-  msg "Passwords empty or didn't match. Try again." 7
-done
-TZ_="$(dialog --stdout --title "$TITLE" --inputbox "Time zone (e.g. Europe/Prague, America/New_York, UTC):" 8 60 "UTC")" || exit 0
-[[ -e "/usr/share/zoneinfo/$TZ_" ]] || die "unknown time zone: $TZ_"
-LOCALE="$(dialog --stdout --title "$TITLE" --inputbox "Language/locale:" 8 50 "en_US.UTF-8")" || exit 0
-KEYMAP="$(dialog --stdout --title "$TITLE" --inputbox "Keyboard layout (console keymap, e.g. us, cz, de):" 8 60 "us")" || exit 0
+rep() { local s="" i; for ((i=0; i<$2; i++)); do s+=$1; done; printf '%s' "$s"; }
 
-dialog --title "$TITLE" --yesno "Ready to install:\n\n  Disk      : $DISK  (ERASED)\n  Boot mode : ${MODE^^}\n  Desktop   : $PROFILE\n  Hostname  : $HOSTNAME_\n  User      : $USERNAME  (sudo)\n  Time zone : $TZ_\n  Locale    : $LOCALE\n  Keymap    : $KEYMAP\n\nBegin installation?" 19 60 || { clear; exit 0; }
-clear
+draw_bar() { # draw_bar PERCENT "text"
+  local pct=$1 text=${2:-} w=28 f cols
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  f=$(( pct * w / 100 ))
+  cols=$(tput cols 2>/dev/null || echo 80)
+  text=${text:0:$(( cols - w - 12 > 10 ? cols - w - 12 : 10 ))}
+  printf '\r  %s%s%s%s%s %3d%%  %s\e[K' "$Y" "$(rep '█' "$f")" "$D" "$(rep '░' $((w - f)))" "$N" "$pct" "$text"
+}
 
-# ---------- partition + format ----------
-part() { [[ "$DISK" =~ [0-9]$ ]] && echo "${DISK}p$1" || echo "${DISK}$1"; }
+dirsize() { du -sb "$1" 2>/dev/null | cut -f1 | grep -E '^[0-9]+$' || echo 0; }
 
-echo ">> Partitioning $DISK ($MODE)…"
-run wipefs -af "$DISK"
-run sgdisk --zap-all "$DISK"
-if [[ $MODE == uefi ]]; then
-  run sgdisk -n1:0:+1G -t1:ef00 -c1:ESP "$DISK"
-else
-  run sgdisk -n1:0:+1M -t1:ef02 -c1:bios_boot "$DISK"
-fi
-run sgdisk -n2:0:0 -t2:8300 -c2:verity-root "$DISK"
-run partprobe "$DISK"; run udevadm settle
-ESP="$(part 1)"; ROOT="$(part 2)"
+# total download size (bytes) for a list of packages, dependencies included
+pkg_bytes() { pacman -Sp --print-format '%s' "$@" 2>>"$LOG" | awk '{s+=$1} END {print s+0}'; }
 
-echo ">> Creating filesystems…"
-[[ $MODE == uefi ]] && run mkfs.fat -F32 -n VERITYESP "$ESP"
-run mkfs.btrfs -f -L verity "$ROOT"
-run mount "$ROOT" /mnt
-for sv in @ @home @snapshots @log; do run btrfs subvolume create "/mnt/$sv"; done
-run umount /mnt
+run() { # run CMD...  (output goes to the log; dies on failure)
+  if (( DRY )); then printf '  %s[dry-run]%s %s\n' "$D" "$N" "$*"; return 0; fi
+  printf '\n$ %s\n' "$*" >>"$LOG"
+  "$@" >>"$LOG" 2>&1 || die "Command failed: $*"
+}
 
-OPTS="noatime,compress=zstd,space_cache=v2"
-run mount -o "$OPTS,subvol=@" "$ROOT" /mnt
-run mkdir -p /mnt/home /mnt/.snapshots /mnt/var/log /mnt/boot
-run mount -o "$OPTS,subvol=@home"      "$ROOT" /mnt/home
-run mount -o "$OPTS,subvol=@snapshots" "$ROOT" /mnt/.snapshots
-run mount -o "$OPTS,subvol=@log"       "$ROOT" /mnt/var/log
-[[ $MODE == uefi ]] && run mount "$ESP" /mnt/boot
+# run_with_bar LABEL TOTAL_DOWNLOAD_BYTES CMD...
+# Shows a progress bar with download speed and ETA, then install progress.
+run_with_bar() {
+  local label=$1 total=$2; shift 2
+  info "$label"
+  if (( DRY )); then printf '  %s[dry-run]%s %s\n' "$D" "$N" "$*"; return 0; fi
 
-# ---------- packages ----------
-PKGS=()
-while read -r p; do [[ -n "$p" ]] && PKGS+=("$p"); done < "$SHARE/profiles/base.pkgs"
-[[ $MODE == uefi ]] && PKGS+=(efibootmgr)
-grep -qi 'GenuineIntel' /proc/cpuinfo && PKGS+=(intel-ucode)
-grep -qi 'AuthenticAMD' /proc/cpuinfo && PKGS+=(amd-ucode)
-if [[ $PROFILE != none ]]; then
-  while read -r p; do [[ -n "$p" ]] && PKGS+=("$p"); done < "$SHARE/profiles/$PROFILE/packages"
-fi
+  local cache="$MNT/var/cache/pacman/pkg" steplog pid rc
+  local before last now dl speed pct extra inst n m eta t0=$SECONDS lastt=$SECONDS dt
+  steplog=$(mktemp)
+  before=$(dirsize "$cache"); last=$before
 
-echo ">> Installing ${#PKGS[@]} packages (this takes a while)…"
-if (( DRY )); then echo "[dry-run] pacstrap -K /mnt ${PKGS[*]}" >> "$LOG"
-else pacstrap -K /mnt "${PKGS[@]}" 2>&1 | tee -a "$LOG" || die "pacstrap failed."; fi
+  printf '\n$ %s\n' "$*" >>"$LOG"
+  "$@" >"$steplog" 2>&1 &
+  pid=$!
 
-run bash -c 'genfstab -U /mnt >> /mnt/etc/fstab'
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    now=$(dirsize "$cache"); dl=$(( now - before )); (( dl < 0 )) && dl=0
+    dt=$(( SECONDS - lastt )); (( dt < 1 )) && dt=1
+    speed=$(( (now - last) / dt )); (( speed < 0 )) && speed=0
+    last=$now; lastt=$SECONDS
 
-# ---------- Verity files into the new system ----------
-echo ">> Installing Verity tools & branding…"
-run install -Dm755 /usr/local/bin/verity      /mnt/usr/local/bin/verity
-run install -Dm755 /usr/local/bin/verityfetch /mnt/usr/local/bin/verityfetch
-run mkdir -p /mnt/usr/share/verity /mnt/etc/pacman.d/hooks
-run install -m644 "$SHARE/logo.txt"   /mnt/usr/share/verity/logo.txt
-run install -m644 "$SHARE/os-release" /mnt/usr/share/verity/os-release
-run install -m644 "$SHARE/profiles/common/verity-branding.hook" /mnt/etc/pacman.d/hooks/verity-branding.hook
-run cp -a "$SHARE/profiles/common/skel/." /mnt/etc/skel/
-[[ $PROFILE == hypr ]] && run cp -a "$SHARE/profiles/hypr/skel/." /mnt/etc/skel/
-[[ $PROFILE == hypr ]] && run sed -i "s/kb_layout = us/kb_layout = ${KEYMAP%%-*}/" /mnt/etc/skel/.config/hypr/hyprland.conf
-run install -m644 /etc/motd  /mnt/etc/motd
-run install -m644 /etc/issue /mnt/etc/issue
+    inst=$(grep -a -E '^\( *[0-9]+/[0-9]+\) installing' "$steplog" 2>/dev/null | tail -n 1)
+    if [[ -n $inst ]]; then
+      n=$(sed -E 's/^\( *([0-9]+)\/([0-9]+)\).*/\1/' <<<"$inst")
+      m=$(sed -E 's/^\( *([0-9]+)\/([0-9]+)\).*/\2/' <<<"$inst")
+      pct=$(( 60 + 40 * n / (m > 0 ? m : 1) ))
+      extra="installing ${inst#*installing } (${n}/${m})"
+    else
+      pct=0; (( total > 0 )) && pct=$(( 60 * dl / total )); (( pct > 60 )) && pct=60
+      eta=""
+      if (( speed > 0 && total > dl )); then eta="  ETA $(fmt_time $(( (total - dl) / speed )))"; fi
+      extra="downloading $(fmt_bytes "$dl") / $(fmt_bytes "$total")  $(fmt_bytes "$speed")/s${eta}"
+    fi
+    (( pct > 99 )) && pct=99
+    draw_bar "$pct" "$extra"
+  done
 
-# ---------- configure inside the chroot ----------
-echo ">> Configuring the new system…"
-DM=""; [[ $PROFILE != none ]] && DM=sddm
-if (( ! DRY )); then
-  {
-    printf 'HOSTNAME_=%q\nUSERNAME=%q\nTZ_=%q\nLOCALE=%q\nKEYMAP=%q\nMODE=%q\nDISK=%q\nDM=%q\n' \
-      "$HOSTNAME_" "$USERNAME" "$TZ_" "$LOCALE" "$KEYMAP" "$MODE" "$DISK" "$DM"
-  } > /mnt/root/verity.env
-  printf '%s:%s\n' "$USERNAME" "$PW1" > /mnt/root/.verity-pw
-  chmod 600 /mnt/root/verity.env /mnt/root/.verity-pw
+  wait "$pid"; rc=$?
+  cat "$steplog" >>"$LOG"; rm -f "$steplog"
+  if (( rc == 0 )); then
+    draw_bar 100 "done in $(fmt_time $(( SECONDS - t0 )))"; printf '\n'
+  else
+    printf '\n'; die "Step failed (exit $rc): $label"
+  fi
+}
 
-  cat > /mnt/root/verity-chroot.sh <<'CHROOT'
-#!/usr/bin/env bash
-set -u
-. /root/verity.env
-warn() { echo "WARN: $*"; }
+# ------------------------------------------------------------------ network
+have_net() { curl -fsS --max-time 6 -o /dev/null https://archlinux.org 2>/dev/null; }
 
-ln -sf "/usr/share/zoneinfo/$TZ_" /etc/localtime
-hwclock --systohc || warn "hwclock failed"
-sed -i "s/^#\(${LOCALE}[[:space:]]\)/\1/" /etc/locale.gen
-locale-gen
-echo "LANG=$LOCALE" > /etc/locale.conf
-echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
-echo "$HOSTNAME_" > /etc/hostname
-cat > /etc/hosts <<HOSTS
-127.0.0.1  localhost
-::1        localhost
-127.0.1.1  $HOSTNAME_.localdomain $HOSTNAME_
-HOSTS
+wifi_iface() {
+  local d
+  for d in /sys/class/net/*/wireless; do
+    [[ -d $d ]] && { basename "$(dirname "$d")"; return 0; }
+  done
+  return 1
+}
 
-# branding (os-release is a symlink to /usr/lib/os-release)
-install -m644 /usr/share/verity/os-release /usr/lib/os-release
+wifi_summary() { # prints: SSID, signal, link speed (only when connected over wifi)
+  local i; i=$(wifi_iface) || return 1
+  command -v iw >/dev/null || return 1
+  local out; out=$(iw dev "$i" link 2>/dev/null)
+  [[ $out == *"Not connected"* || -z $out ]] && return 1
+  local ssid sig rate
+  ssid=$(awk -F': ' '/SSID:/ {print $2; exit}' <<<"$out")
+  sig=$(awk '/signal:/ {print $2; exit}' <<<"$out")
+  rate=$(awk '/tx bitrate:/ {print $3" "$4; exit}' <<<"$out")
+  printf '%s|%s|%s\n' "$ssid" "$sig" "$rate"
+}
 
-# user + sudo, root login locked
-useradd -m -G wheel -s /usr/bin/zsh "$USERNAME"
-chpasswd < /root/.verity-pw
-passwd -l root >/dev/null
-sed -i 's/^# \(%wheel ALL=(ALL:ALL) ALL\)/\1/' /etc/sudoers
+wifi_connect() {
+  local i ssid pw
+  i=$(wifi_iface) || { warn "No Wi-Fi adapter found. Plug in an Ethernet cable instead."; return 1; }
+  rfkill unblock wifi 2>/dev/null || true
+  if command -v nmcli >/dev/null && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    nmcli device wifi rescan 2>/dev/null || true; sleep 2
+    nmcli -f SSID,SIGNAL,SECURITY device wifi list 2>/dev/null | head -n 15
+    ask ssid "Network name (SSID)"
+    read -rsp "  Password (leave empty for an open network): " pw; echo
+    if [[ -n $pw ]]; then nmcli device wifi connect "$ssid" password "$pw" >>"$LOG" 2>&1
+    else nmcli device wifi connect "$ssid" >>"$LOG" 2>&1; fi
+  elif command -v iwctl >/dev/null; then
+    iwctl station "$i" scan 2>/dev/null; sleep 3
+    iwctl station "$i" get-networks 2>/dev/null | head -n 20
+    ask ssid "Network name (SSID)"
+    read -rsp "  Password (leave empty for an open network): " pw; echo
+    if [[ -n $pw ]]; then iwctl --passphrase "$pw" station "$i" connect "$ssid" >>"$LOG" 2>&1
+    else iwctl station "$i" connect "$ssid" >>"$LOG" 2>&1; fi
+  else
+    warn "No Wi-Fi tool found (nmcli / iwctl)."; return 1
+  fi
+  sleep 4
+  have_net
+}
 
-systemctl enable NetworkManager
-[[ -n "$DM" ]] && systemctl enable "$DM"
+boxline() { # boxline TEXT [COLOR]  (red box, text padded to the border)
+  printf '  %s│%s  %s%-57s%s %s│%s\n' "$R" "$N" "${2:-}" "$1" "$N" "$R" "$N"
+}
 
-# bootloader
-sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Verity OS"/' /etc/default/grub
-if [[ $MODE == uefi ]]; then
-  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=VerityOS --removable || { echo "GRUB install failed"; exit 1; }
-else
-  grub-install --target=i386-pc "$DISK" || { echo "GRUB install failed"; exit 1; }
-fi
-grub-mkconfig -o /boot/grub/grub.cfg || { echo "grub-mkconfig failed"; exit 1; }
+offline_disclaimer() {
+  local bar; bar=$(rep '─' 60)
+  printf '\n  %s┌%s┐%s\n' "$R" "$bar" "$N"
+  boxline "No internet connection" "$B"
+  boxline ""
+  boxline "Verity OS downloads its packages while installing:"
+  boxline "about 1 GB (terminal only) up to 4 GB (full desktop)."
+  boxline "The installer cannot continue without internet."
+  boxline "Nothing on your disk has been changed." "$G"
+  printf '  %s└%s┘%s\n\n' "$R" "$bar" "$N"
+}
 
-# snapshots (best effort — experimental)
-(
-  umount /.snapshots 2>/dev/null; rmdir /.snapshots 2>/dev/null
-  snapper --no-dbus -c root create-config / &&
-  btrfs subvolume delete /.snapshots >/dev/null &&
-  mkdir /.snapshots && mount /.snapshots && chmod 750 /.snapshots
-) || warn "snapper setup didn't complete — snapshots/rollback unavailable until configured manually"
-CHROOT
-  chmod 700 /mnt/root/verity-chroot.sh
-  arch-chroot /mnt /root/verity-chroot.sh 2>&1 | tee -a "$LOG"
-  rc=${PIPESTATUS[0]}
-  shred -u /mnt/root/.verity-pw 2>/dev/null || rm -f /mnt/root/.verity-pw
-  rm -f /mnt/root/verity.env /mnt/root/verity-chroot.sh
-  (( rc == 0 )) || die "configuration step failed (see $LOG)."
-else
-  echo "[dry-run] chroot configuration (timezone, locale, user, sudo, services, GRUB, snapper)" >> "$LOG"
-fi
+network_step() {
+  printf '\n%sChecking your internet connection...%s\n' "$B" "$N"
+  while ! have_net; do
+    offline_disclaimer
+    info "[w] connect to Wi-Fi    [r] retry (e.g. after plugging in Ethernet)    [q] quit"
+    local c; read -rp "  > " c || c=q
+    case "$c" in
+      w|W) wifi_connect && break || warn "Still offline." ;;
+      r|R) : ;;
+      q|Q) say "  Bye. Nothing was changed."; exit 0 ;;
+    esac
+  done
+  ok "Online"
+}
 
-run sync
-(( DRY )) || umount -R /mnt
+speed_test() { # bytes per second (0 if it failed)
+  local v
+  v=$(curl -s -o /dev/null --max-time 6 -w '%{speed_download}' \
+        "https://speed.cloudflare.com/__down?bytes=50000000" 2>/dev/null | cut -d. -f1)
+  [[ $v =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+}
 
-if (( DRY )); then
-  msg "Dry run finished — nothing was changed.\n\nCommands that would run:\n$LOG" 9
-  clear; echo "Dry-run log: $LOG"; exit 0
-fi
-dialog --title "$TITLE" --yesno "🟡 Verity OS is installed.\n\nRemove the install media, then reboot.\n\nReboot now?" 10 56 && { clear; reboot; }
-clear; echo "Done. Run 'reboot' when ready. Install log: $LOG"
+# ------------------------------------------------------------------ questions
+live_disk() {
+  local src; src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null) || return 0
+  lsblk -no PKNAME "$src" 2>/dev/null | head -n 1
+}
+
+choose_disk() {
+  local live line NAME SIZE MODEL TYPE n=0 pick
+  live=$(live_disk)
+  DISKS=()
+  say; say "  ${B}Where should Verity OS be installed?${N}"
+  while IFS= read -r line; do
+    eval "$line"
+    [[ $TYPE == disk ]] || continue
+    [[ $NAME == /dev/zram* || $NAME == /dev/ram* ]] && continue
+    [[ -n $live && ${NAME#/dev/} == "$live" ]] && continue   # never offer the install medium
+    n=$((n+1)); DISKS+=("$NAME")
+    printf '    %s%d)%s %s  %s  %s\n' "$Y" "$n" "$N" "$NAME" "$SIZE" "${MODEL:-unknown}"
+  done < <(lsblk -dpnP -o NAME,SIZE,MODEL,TYPE 2>/dev/null)
+  (( n > 0 )) || die "No installable disk found."
+  while true; do
+    ask pick "Disk number" "1"
+    [[ $pick =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= n )) && { DISK=${DISKS[pick-1]}; break; }
+    warn "Pick a number from the list."
+  done
+}
+
+choose_profile() {
+  say; say "  ${B}Which edition?${N}"
+  info "${Y}1)${N} Verity Hypr      tiling desktop (Hyprland, needs real GPU / 3D)"
+  info "${Y}2)${N} Verity Desktop   KDE Plasma, works almost everywhere"
+  info "${Y}3)${N} Terminal only    no desktop"
+  local p; ask p "Edition" "2"
+  case "$p" in 1) PROFILE=hypr ;; 3) PROFILE=none ;; *) PROFILE=kde ;; esac
+  AUTOLOGIN=0
+  if [[ $PROFILE != none ]]; then
+    confirm "Skip the login screen (log in automatically)?" && AUTOLOGIN=1 || AUTOLOGIN=0
+  fi
+}
+
+choose_keyboard() {
+  local maps; maps=$(localectl list-keymaps 2>/dev/null || true)
+  say; say "  ${B}Keyboard layout${N} ${D}(examples: us, cz-qwertz, de, fr, uk)${N}"
+  while true; do
+    ask KEYMAP "Keymap" "us"
+    [[ -z $maps ]] && break                       # cannot validate: trust the user
+    grep -Fxq "$KEYMAP" <<<"$maps" && break
+    warn "Unknown keymap. Try 'localectl list-keymaps' in another terminal."
+  done
+  loadkeys "$KEYMAP" 2>/dev/null || true
+}
+
+choose_identity() {
+  local pw2
+  say; say "  ${B}About this computer${N}"
+  while true; do
+    ask HOSTNAME_ "Computer name" "verityos"
+    [[ $HOSTNAME_ =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] && break
+    warn "Use lowercase letters, numbers and dashes."
+  done
+  while true; do
+    ask TZ_ "Time zone (e.g. Europe/Prague, America/New_York)" "UTC"
+    [[ -f /usr/share/zoneinfo/$TZ_ ]] && break
+    warn "Unknown time zone."
+  done
+  while true; do
+    ask USERNAME "Your username"
+    [[ $USERNAME =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] && break
+    warn "Use lowercase letters, numbers, dashes and underscores."
+  done
+  while true; do
+    read -rsp "  Password for $USERNAME: " PASSWORD || die "Input closed, aborting."; echo
+    read -rsp "  Repeat password: " pw2 || die "Input closed, aborting."; echo
+    [[ -n $PASSWORD && $PASSWORD == "$pw2" ]] && break
+    warn "Passwords are empty or do not match."
+  done
+}
+
+# ------------------------------------------------------------------ pre-download notice
+download_notice() {
+  local base_b desk_b total speed mbit eta w ssid sig rate
+  say; say "  ${B}Checking download size and your connection...${N}"
+  pacman -Sy --noconfirm >>"$LOG" 2>&1 || warn "Could not refresh package lists (see $LOG)"
+
+  base_b=$(pkg_bytes "${BASE_PKGS[@]}")
+  desk_b=0
+  if [[ $PROFILE != none ]]; then
+    # shellcheck disable=SC2046
+    desk_b=$(pkg_bytes $(bash /usr/local/bin/verity-setup-desktop --list "$PROFILE" 2>/dev/null))
+  fi
+  BASE_BYTES=$base_b; DESK_BYTES=$desk_b; total=$(( base_b + desk_b ))
+
+  info "Testing download speed (about 6 seconds)..."
+  speed=$(speed_test)
+
+  say
+  say "  ${Y}┌─ Before we start ─────────────────────────────────────────┐${N}"
+  printf '  %s│%s  Download size : %s%s%s\n' "$Y" "$N" "$B" "$(fmt_bytes "$total")" "$N"
+  if w=$(wifi_summary); then
+    IFS='|' read -r ssid sig rate <<<"$w"
+    printf '  %s│%s  Connection    : Wi-Fi "%s"  signal %s dBm  link %s\n' "$Y" "$N" "$ssid" "${sig:-?}" "${rate:-?}"
+  else
+    printf '  %s│%s  Connection    : wired / other\n' "$Y" "$N"
+  fi
+  if (( speed > 0 )); then
+    mbit=$(awk -v s="$speed" 'BEGIN {printf "%.1f", s*8/1000000}')
+    eta=$(( total / speed ))
+    printf '  %s│%s  Measured speed: %s%s Mbit/s%s  (download takes about %s)\n' "$Y" "$N" "$B" "$mbit" "$N" "$(fmt_time "$eta")"
+  else
+    printf '  %s│%s  Measured speed: could not be measured\n' "$Y" "$N"
+  fi
+  say "  ${Y}│${N}  If you are on a mobile hotspot, this counts against your data."
+  say "  ${Y}└───────────────────────────────────────────────────────────┘${N}"
+
+  if (( speed > 0 && speed < 625000 )); then
+    warn "Your connection is slow (under 5 Mbit/s). Ethernet or a closer router would help."
+  fi
+  if [[ -n ${sig:-} && ${sig%.*} =~ ^-[0-9]+$ ]] && (( ${sig%.*} < -75 )); then
+    warn "Wi-Fi signal is weak (${sig} dBm). Move closer to the router for a faster install."
+  fi
+  confirm "Download and install now?" || { say "  Cancelled. Nothing was changed."; exit 0; }
+}
+
+# ------------------------------------------------------------------ install steps
+part() { if [[ $DISK =~ [0-9]$ ]]; then printf '%sp%s' "$DISK" "$1"; else printf '%s%s' "$DISK" "$1"; fi; }
+
+confirm_erase() {
+  say; say "  ${R}${B}ALL DATA ON $DISK WILL BE ERASED.${N}"
+  local t; read -rp "  Type the disk name ($DISK) to continue: " t || t=""
+  [[ $t == "$DISK" ]] || { say "  Cancelled. Nothing was changed."; exit 0; }
+}
+
+do_partition() {
+  step 1 "Partitioning $DISK"
+  if (( ! DRY )); then umount -R "$MNT" 2>/dev/null || true; swapoff -a 2>/dev/null || true; fi
+  run wipefs -af "$DISK"
+  run parted -s "$DISK" mklabel gpt
+  if (( UEFI )); then
+    run parted -s "$DISK" mkpart ESP fat32 1MiB 1025MiB
+    run parted -s "$DISK" set 1 esp on
+  else
+    run parted -s "$DISK" mkpart bios_boot 1MiB 3MiB
+    run parted -s "$DISK" set 1 bios_grub on
+  fi
+  if (( UEFI )); then run parted -s "$DISK" mkpart root ext4 1025MiB 100%
+  else run parted -s "$DISK" mkpart root ext4 3MiB 100%; fi
+  (( DRY )) || { partprobe "$DISK" 2>/dev/null; udevadm settle; sleep 1; }
+  ok "Disk partitioned ($([[ $UEFI == 1 ]] && echo UEFI || echo BIOS) mode)"
+}
+
+do_format() {
+  step 2 "Formatting and mounting"
+  ROOT_PART=$(part 2); BOOT_PART=$(part 1)
+  run mkfs.ext4 -F -L verityos "$ROOT_PART"
+  run mount "$ROOT_PART" "$MNT"
+  if (( UEFI )); then
+    run mkfs.fat -F32 -n VERITYBOOT "$BOOT_PART"
+    run mkdir -p "$MNT/boot"
+    run mount "$BOOT_PART" "$MNT/boot"
+  fi
+  ok "Disk ready"
+}
+
+do_base() {
+  step 3 "Installing the base system"
+  run_with_bar "Downloading and installing packages" "$BASE_BYTES" pacstrap -K "$MNT" "${BASE_PKGS[@]}"
+  run bash -c "genfstab -U '$MNT' >> '$MNT/etc/fstab'"
+  ok "Base system installed"
+}
+
+write_branding() {
+  cat > "$MNT/usr/lib/os-release" <<'EOF'
+NAME="Verity OS"
+PRETTY_NAME="Verity OS"
+ID=verityos
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="38;2;255;210;26"
+HOME_URL="https://github.com/jindroman/verityOS"
+BUG_REPORT_URL="https://github.com/jindroman/verityOS/issues"
+LOGO=verityos
+EOF
+  # keep pacman from restoring the Arch os-release on filesystem updates
+  grep -q 'usr/lib/os-release' "$MNT/etc/pacman.conf" || \
+    sed -i '/^\[options\]/a NoUpgrade = usr/lib/os-release' "$MNT/etc/pacman.conf"
+  cat > "$MNT/etc/issue" <<'EOF'
+\e[1;33m
+ ╦  ╦╔═╗╦═╗╦╔╦╗╦ ╦  ╔═╗╔═╗
+ ╚╗╔╝║╣ ╠╦╝║ ║ ╚╦╝  ║ ║╚═╗
+  ╚╝ ╚═╝╩╚═╩ ╩  ╩   ╚═╝╚═╝\e[0m
+ \S  \r  (\l)
+
+EOF
+  cat > "$MNT/etc/motd" <<'EOF'
+
+ Welcome to Verity OS.
+
+   Ask the AI helper ....  verity ask "how do I connect to wifi?"
+   Update everything ....  verity update
+   System info ..........  verityfetch
+
+EOF
+}
+
+do_configure() {
+  step 4 "Configuring your system"
+  if (( DRY )); then info "[dry-run] timezone, locale, keyboard, hostname, user, branding, tools"; return 0; fi
+
+  local layout=${KEYMAP%%-*}; [[ $layout == uk ]] && layout=gb
+
+  ln -sf "/usr/share/zoneinfo/$TZ_" "$MNT/etc/localtime"
+  arch-chroot "$MNT" hwclock --systohc >>"$LOG" 2>&1
+  sed -i 's/^#en_US.UTF-8/en_US.UTF-8/' "$MNT/etc/locale.gen"
+  arch-chroot "$MNT" locale-gen >>"$LOG" 2>&1
+  echo "LANG=en_US.UTF-8" > "$MNT/etc/locale.conf"
+  echo "KEYMAP=$KEYMAP"   > "$MNT/etc/vconsole.conf"
+  echo "$HOSTNAME_"       > "$MNT/etc/hostname"
+  printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 %s\n' "$HOSTNAME_" > "$MNT/etc/hosts"
+
+  mkdir -p "$MNT/etc/X11/xorg.conf.d"
+  cat > "$MNT/etc/X11/xorg.conf.d/00-keyboard.conf" <<EOF
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$layout"
+EndSection
+EOF
+
+  arch-chroot "$MNT" useradd -m -G wheel -s /bin/bash "$USERNAME" >>"$LOG" 2>&1 || die "Could not create user $USERNAME"
+  printf '%s:%s\n' "$USERNAME" "$PASSWORD" | arch-chroot "$MNT" chpasswd || die "Could not set the password"
+  arch-chroot "$MNT" passwd -l root >>"$LOG" 2>&1
+  echo '%wheel ALL=(ALL:ALL) ALL' > "$MNT/etc/sudoers.d/10-wheel"
+  chmod 440 "$MNT/etc/sudoers.d/10-wheel"
+
+  arch-chroot "$MNT" systemctl enable NetworkManager fstrim.timer >>"$LOG" 2>&1
+  [[ $VM == oracle ]] && arch-chroot "$MNT" systemctl enable vboxservice >>"$LOG" 2>&1
+
+  write_branding
+
+  local f
+  for f in verity verityfetch verity-ask verity-setup-desktop; do
+    [[ -f /usr/local/bin/$f ]] && install -Dm755 "/usr/local/bin/$f" "$MNT/usr/local/bin/$f"
+  done
+  ok "System configured"
+}
+
+do_desktop() {
+  step 5 "Installing the desktop"
+  if [[ $PROFILE == none ]]; then info "Terminal only: skipped"; return 0; fi
+  local args=("$PROFILE" "$USERNAME"); (( AUTOLOGIN )) && args+=(--autologin)
+  run_with_bar "Downloading and installing desktop packages" "$DESK_BYTES" \
+    arch-chroot "$MNT" /usr/local/bin/verity-setup-desktop "${args[@]}"
+  ok "Desktop installed. The system will boot straight into it."
+}
+
+do_bootloader() {
+  step 6 "Installing the bootloader"
+  if (( DRY )); then info "[dry-run] grub-install + efibootmgr boot order"; return 0; fi
+
+  sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Verity OS"/; s/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=3/' "$MNT/etc/default/grub"
+  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"/' "$MNT/etc/default/grub"
+
+  if (( UEFI )); then
+    # normal entry (registers a boot menu item) ...
+    arch-chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=VerityOS --recheck >>"$LOG" 2>&1 \
+      || warn "Could not register a boot menu entry; using the fallback location only."
+    # ... plus the fallback path, so firmware that forgets entries (VirtualBox!) still boots the disk
+    arch-chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot --removable --recheck >>"$LOG" 2>&1 \
+      || die "Bootloader installation failed"
+  else
+    arch-chroot "$MNT" grub-install --target=i386-pc "$DISK" >>"$LOG" 2>&1 || die "Bootloader installation failed"
+  fi
+  arch-chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg >>"$LOG" 2>&1 || die "Could not generate the boot menu"
+
+  # Make the new system the FIRST thing the firmware boots, and force it for the next boot.
+  if (( UEFI )) && command -v efibootmgr >/dev/null; then
+    local num order rest
+    num=$(efibootmgr 2>/dev/null | awk '/VerityOS/ {sub(/^Boot/,"",$1); sub(/\*/,"",$1); print $1; exit}')
+    if [[ -n $num ]]; then
+      order=$(efibootmgr | awk -F': ' '/^BootOrder/ {print $2}')
+      rest=$(tr ',' '\n' <<<"$order" | grep -vx "$num" | paste -sd, -)
+      efibootmgr -o "${num}${rest:+,$rest}" >>"$LOG" 2>&1 || true
+      efibootmgr -n "$num" >>"$LOG" 2>&1 || true
+    fi
+  fi
+  ok "Bootloader installed"
+}
+
+do_finish() {
+  step 7 "Finishing up"
+  if (( DRY )); then info "[dry-run] unmount, eject, reboot"; return 0; fi
+  rm -rf "$MNT"/var/cache/pacman/pkg/* 2>/dev/null
+  sync
+  umount -R "$MNT" >>"$LOG" 2>&1 || warn "Could not unmount cleanly."
+
+  local src; src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+  [[ $src == /dev/sr* ]] && eject "$src" 2>/dev/null || true
+
+  say
+  say "  ${G}${B}Verity OS is installed.${N}  (took $(fmt_time $(( SECONDS - START ))))"
+  say
+  say "  ${B}Remove the installation USB stick or ISO now${N}, otherwise the computer"
+  say "  may boot the installer again instead of your new system."
+  (( UEFI )) || say "  ${D}(BIOS mode: removing the install media is required.)${N}"
+  say
+  read -rp "  Press Enter to reboot... " _ || true
+  systemctl reboot 2>/dev/null || reboot
+}
+
+# ------------------------------------------------------------------ main
+main() {
+  case "${1:-}" in
+    --dry-run) DRY=1 ;;
+    -h|--help) usage ;;
+  esac
+
+  : > "$LOG"
+  trap 'printf "\n"; die "Interrupted. If the installation had started, the disk may be half-installed."' INT TERM
+
+  banner
+  (( EUID == 0 )) || die "Run as root:  sudo verity-install"
+  if (( DRY )); then
+    warn "DRY RUN: nothing will be changed."
+  else
+    [[ -d /run/archiso ]] || die "This must be run from the Verity OS live ISO (refusing to touch a running system)."
+    local t; for t in parted pacstrap arch-chroot genfstab mkfs.ext4 mkfs.fat curl lsblk findmnt; do
+      command -v "$t" >/dev/null || die "Missing tool: $t"
+    done
+  fi
+
+  UEFI=0; [[ -d /sys/firmware/efi/efivars ]] && UEFI=1
+  VM=$(systemd-detect-virt 2>/dev/null || echo none)
+  info "Boot mode: $([[ $UEFI == 1 ]] && echo UEFI || echo BIOS)    Virtual machine: $VM"
+
+  network_step
+  choose_keyboard
+  choose_disk
+  choose_profile
+  choose_identity
+
+  BASE_PKGS=(base linux linux-firmware sudo nano man-db networkmanager wpa_supplicant iw grub dosfstools e2fsprogs python)
+  (( UEFI )) && BASE_PKGS+=(efibootmgr)
+  grep -q GenuineIntel /proc/cpuinfo 2>/dev/null && BASE_PKGS+=(intel-ucode)
+  grep -q AuthenticAMD /proc/cpuinfo 2>/dev/null && BASE_PKGS+=(amd-ucode)
+  [[ $VM == oracle ]] && BASE_PKGS+=(virtualbox-guest-utils)
+
+  say; say "  ${B}Summary${N}"
+  info "Disk      : $DISK  ${R}(will be erased)${N}"
+  info "Edition   : $PROFILE$([[ $AUTOLOGIN == 1 ]] && echo ' (auto-login)')"
+  info "User      : $USERNAME @ $HOSTNAME_    Time zone: $TZ_    Keymap: $KEYMAP"
+
+  download_notice
+  confirm_erase
+
+  do_partition
+  do_format
+  do_base
+  do_configure
+  do_desktop
+  do_bootloader
+  do_finish
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

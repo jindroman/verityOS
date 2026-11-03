@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# verity-setup-desktop <hypr|kde|none> <username> [--autologin]
+#
+# Run INSIDE the installed system (e.g. arch-chroot /mnt verity-setup-desktop hypr jan).
+# Installs the desktop, enables the login manager and makes the system boot
+# straight into a graphical login with the chosen desktop pre-selected.
+set -euo pipefail
+
+log()  { echo "[verity-setup-desktop] $*"; }
+die()  { echo "[verity-setup-desktop] ERROR: $*" >&2; exit 1; }
+
+PROFILE="${1:-}"
+USERNAME="${2:-}"
+AUTOLOGIN=0
+[[ "${3:-}" == "--autologin" ]] && AUTOLOGIN=1
+
+[[ $EUID -eq 0 ]] || die "must run as root (inside the installed system)"
+
+case "$PROFILE" in
+  hypr|hyprland)            PROFILE=hypr ;;
+  kde|plasma|desktop)       PROFILE=kde ;;
+  none|terminal|tty|"")     log "terminal-only profile, nothing to do"; exit 0 ;;
+  *) die "unknown profile '$PROFILE' (use hypr, kde or none)" ;;
+esac
+
+id "$USERNAME" &>/dev/null || die "user '$USERNAME' does not exist yet; create it before running this"
+
+COMMON=(sddm networkmanager mesa xorg-xwayland pipewire pipewire-pulse wireplumber
+        xdg-user-dirs noto-fonts ttf-dejavu qt5-wayland qt6-wayland python)
+HYPR=(hyprland kitty waybar wofi thunar xdg-desktop-portal-hyprland hyprpolkitagent)
+KDE=(plasma-meta konsole dolphin kate)
+
+if [[ $PROFILE == hypr ]]; then
+  PKGS=("${COMMON[@]}" "${HYPR[@]}")
+  SESSION_FILE="hyprland.desktop"
+  SESSION_PATH="/usr/share/wayland-sessions/hyprland.desktop"
+else
+  PKGS=("${COMMON[@]}" "${KDE[@]}")
+  SESSION_FILE="plasma.desktop"
+  SESSION_PATH="/usr/share/wayland-sessions/plasma.desktop"
+fi
+
+log "installing packages for profile: $PROFILE"
+pacman -S --needed --noconfirm "${PKGS[@]}"
+
+[[ -f $SESSION_PATH ]] || log "WARNING: $SESSION_PATH not found; check the package installed correctly"
+
+# ---- Hyprland starter config -------------------------------------------------
+install_hypr_config() {
+  local dest="$1" src
+  [[ -f "$dest/hyprland.conf" ]] && return 0
+  mkdir -p "$dest"
+  src="$(find /usr/share/verity -name hyprland.conf 2>/dev/null | head -n1 || true)"
+  if [[ -n "$src" ]]; then
+    cp "$src" "$dest/hyprland.conf"
+    return 0
+  fi
+
+  local layout="us"
+  if [[ -f /etc/vconsole.conf ]]; then
+    layout="$(sed -n 's/^KEYMAP=//p' /etc/vconsole.conf | head -n1 | cut -d- -f1)"
+    layout="${layout:-us}"
+    [[ $layout == uk ]] && layout="gb"
+  fi
+
+  cat > "$dest/hyprland.conf" <<EOF
+# Verity Hypr - starter config (edit freely)
+monitor = , preferred, auto, 1
+
+\$terminal = kitty
+\$files    = thunar
+\$menu     = wofi --show drun
+\$mod      = SUPER
+
+exec-once = waybar
+exec-once = systemctl --user start hyprpolkitagent
+
+input {
+    kb_layout = $layout
+    follow_mouse = 1
+    touchpad { natural_scroll = true }
+}
+
+general {
+    gaps_in = 5
+    gaps_out = 10
+    border_size = 2
+    col.active_border = rgba(ffd21aee)
+    col.inactive_border = rgba(333333aa)
+    layout = dwindle
+}
+
+decoration { rounding = 8 }
+
+bind = \$mod, Return, exec, \$terminal
+bind = \$mod, D, exec, \$menu
+bind = \$mod, E, exec, \$files
+bind = \$mod, Q, killactive
+bind = \$mod, F, fullscreen
+bind = \$mod, V, togglefloating
+bind = \$mod SHIFT, M, exit
+
+bind = \$mod, left,  movefocus, l
+bind = \$mod, right, movefocus, r
+bind = \$mod, up,    movefocus, u
+bind = \$mod, down,  movefocus, d
+
+bind = \$mod, 1, workspace, 1
+bind = \$mod, 2, workspace, 2
+bind = \$mod, 3, workspace, 3
+bind = \$mod, 4, workspace, 4
+bind = \$mod SHIFT, 1, movetoworkspace, 1
+bind = \$mod SHIFT, 2, movetoworkspace, 2
+bind = \$mod SHIFT, 3, movetoworkspace, 3
+bind = \$mod SHIFT, 4, movetoworkspace, 4
+
+bindm = \$mod, mouse:272, movewindow
+bindm = \$mod, mouse:273, resizewindow
+EOF
+}
+
+if [[ $PROFILE == hypr ]]; then
+  log "writing Hyprland config"
+  install_hypr_config /etc/skel/.config/hypr
+  HOME_DIR="$(getent passwd "$USERNAME" | cut -d: -f6)"
+  install_hypr_config "$HOME_DIR/.config/hypr"
+  chown -R "$USERNAME:$(id -gn "$USERNAME")" "$HOME_DIR/.config"
+fi
+
+# ---- login manager + boot target --------------------------------------------
+log "configuring SDDM"
+mkdir -p /etc/sddm.conf.d
+{
+  echo "[General]"
+  echo "Numlock=on"
+  if [[ $AUTOLOGIN -eq 1 ]]; then
+    echo
+    echo "[Autologin]"
+    echo "User=$USERNAME"
+    echo "Session=$SESSION_FILE"
+    echo "Relogin=false"
+  fi
+} > /etc/sddm.conf.d/10-verity.conf
+
+# Pre-select the right session and user on the login screen
+mkdir -p /var/lib/sddm
+cat > /var/lib/sddm/state.conf <<EOF
+[Last]
+Session=$SESSION_PATH
+User=$USERNAME
+EOF
+chown -R sddm:sddm /var/lib/sddm 2>/dev/null || true
+
+log "enabling services and graphical boot target"
+systemctl enable sddm.service
+systemctl enable NetworkManager.service
+systemctl set-default graphical.target
+
+log "done: the installed system will boot into $PROFILE"

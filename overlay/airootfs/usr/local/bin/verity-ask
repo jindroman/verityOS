@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""verity-ask - the Verity OS AI helper (v0.1)
+
+Usage:
+  verity ask "how do I connect to wifi?"     one question
+  verity ask                                 interactive chat
+  some-command 2>&1 | verity ask "why?"      explain piped output
+  verity ask --setup                         store your API key
+  verity ask --show-context                  show what system info is sent
+  verity ask --no-run                        never offer to run commands
+
+The helper never runs anything without asking you first.
+Only a small system summary (see --show-context) plus what you type is sent.
+"""
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+try:
+    import readline  # noqa: F401  (nicer line editing in chat mode)
+except ImportError:
+    pass
+
+API_URL = "https://api.anthropic.com/v1/messages"
+DEFAULT_MODEL = "claude-sonnet-5-5"
+USER_CONF = os.path.expanduser("~/.config/verity/ai.conf")
+SYS_CONF = "/etc/verity/ai.conf"
+
+SYSTEM_PROMPT = """You are Verity, the friendly assistant built into Verity OS, an Arch-based Linux distribution.
+Be concise and clear; many users are new to Linux.
+When commands are needed, put each step in a ```bash fenced block and briefly explain what it does.
+Prefer Verity commands over raw pacman: verity install/remove/update/search/doctor/clean/history/rollback.
+Never suggest destructive commands (rm -rf, dd, mkfs, partitioning) unless the user explicitly asked, and explain the risk first.
+If you are unsure, say so instead of guessing. The system summary below describes the user's machine."""
+
+DANGEROUS = [
+    r"\brm\s+-[a-zA-Z]*[rf]",
+    r"\bdd\s+.*of=/dev/",
+    r"\bmkfs",
+    r"\bwipefs",
+    r"\b(fdisk|parted|sgdisk|cfdisk)\b",
+    r">\s*/dev/(sd|nvme|vd)",
+    r"chmod\s+-R\s+777",
+    r"(curl|wget)[^|]*\|\s*(sudo\s+)?(ba)?sh",
+    r"pacman\s+.*-R[a-z]*dd",
+    r":\(\)\s*\{",
+]
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+class AIError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config
+def load_conf():
+    conf = {}
+    for path in (SYS_CONF, USER_CONF):
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.strip().strip("\"'")
+        except OSError:
+            pass
+    for k in ("ANTHROPIC_API_KEY", "VERITY_AI_MODEL"):
+        if os.environ.get(k):
+            conf[k] = os.environ[k]
+    return conf
+
+
+def setup():
+    print(c("33;1", "Verity AI setup"))
+    print("Verity talks to Claude through the Anthropic API.")
+    print("Get a key at https://console.anthropic.com (API usage is billed separately")
+    print("from a Claude chat subscription).\n")
+    try:
+        key = getpass.getpass("Paste your API key (input is hidden): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+    if not key:
+        print("No key entered, nothing saved.")
+        return 1
+    os.makedirs(os.path.dirname(USER_CONF), mode=0o700, exist_ok=True)
+    fd = os.open(USER_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"ANTHROPIC_API_KEY={key}\n")
+    print(f"Saved to {USER_CONF} (readable only by you). Try: verity ask \"hello\"")
+    return 0
+
+
+# ---------------------------------------------------------------- context
+def sh(cmd, limit=600):
+    try:
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+    return out.strip()[:limit]
+
+
+def gather_context():
+    lines = [
+        "OS: " + (sh("grep -m1 PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d '\"'") or "Verity OS"),
+        "Kernel: " + sh("uname -r"),
+        "Desktop: " + (os.environ.get("XDG_CURRENT_DESKTOP") or "none/tty")
+        + " (" + (os.environ.get("XDG_SESSION_TYPE") or "unknown") + ")",
+        "Root disk: " + sh("df -h / | tail -n 1"),
+        "Memory: " + sh("free -h | sed -n 2p"),
+    ]
+    failed = sh("systemctl --failed --no-legend --plain 2>/dev/null | head -n 8")
+    lines.append("Failed services: " + (failed.replace("\n", "; ") if failed else "none"))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- API
+def call_api(key, model, system, messages):
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1500,
+        "system": system,
+        "messages": messages,
+    }).encode()
+    req = urllib.request.Request(API_URL, data=body, headers={
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.load(e).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if e.code == 401:
+            raise AIError("The API key was rejected. Run: verity ask --setup")
+        if e.code == 429:
+            raise AIError("Rate limited or out of credit. Try again shortly.")
+        raise AIError(f"API error {e.code}: {detail}")
+    except urllib.error.URLError:
+        raise AIError("Can't reach the API. Are you online?")
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+
+
+# ---------------------------------------------------------------- running commands
+def is_dangerous(cmd):
+    return any(re.search(p, cmd) for p in DANGEROUS)
+
+
+def tty_input(prompt):
+    """Read from the terminal even when stdin is a pipe."""
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(prompt)
+            tty.flush()
+            return tty.readline().strip().lower()
+    except OSError:
+        return None
+
+
+def offer_to_run(reply):
+    blocks = re.findall(r"```(?:bash|sh|shell)?\n(.*?)```", reply, re.S)
+    for block in blocks:
+        cmd = block.strip()
+        if not cmd:
+            continue
+        print(c("2", "\n  $ ") + cmd.replace("\n", "\n    "))
+        if is_dangerous(cmd):
+            print(c("31;1", "  Warning: this command looks risky."))
+            ans = tty_input("  Type 'yes' to run it, anything else to skip: ")
+            ok = ans == "yes"
+        else:
+            ans = tty_input("  Run this? [y/N/q to stop] ")
+            ok = ans in ("y", "yes")
+        if ans is None:
+            return  # no terminal available
+        if ans == "q":
+            return
+        if ok:
+            subprocess.run(["bash", "-c", cmd])
+
+
+# ---------------------------------------------------------------- chat
+def ask(key, model, history, question, context, can_run):
+    history.append({"role": "user", "content": question})
+    system = SYSTEM_PROMPT + "\n\nSystem summary:\n" + context
+    try:
+        reply = call_api(key, model, system, history[-20:])
+    except AIError as e:
+        history.pop()
+        print(c("31", f"verity: {e}"))
+        return
+    history.append({"role": "assistant", "content": reply})
+    print("\n" + c("33;1", "Verity") + "\n" + reply.strip() + "\n")
+    if can_run:
+        offer_to_run(reply)
+
+
+def main(argv):
+    can_run = True
+    show_ctx = False
+    words = []
+    for a in argv[1:]:
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        elif a == "--setup":
+            return setup()
+        elif a == "--no-run":
+            can_run = False
+        elif a == "--show-context":
+            show_ctx = True
+        else:
+            words.append(a)
+
+    context = gather_context()
+    if show_ctx:
+        print(context)
+        return 0
+
+    conf = load_conf()
+    key = conf.get("ANTHROPIC_API_KEY")
+    model = conf.get("VERITY_AI_MODEL", DEFAULT_MODEL)
+    if not key:
+        print(c("33;1", "Verity isn't set up yet.") + " I need an API key first.")
+        if sys.stdin.isatty() and input("Set it up now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+            if setup() != 0:
+                return 1
+            conf = load_conf()
+            key = conf.get("ANTHROPIC_API_KEY")
+        if not key:
+            print("Run: verity ask --setup")
+            return 1
+
+    question = " ".join(words).strip()
+    piped = "" if sys.stdin.isatty() else sys.stdin.read(20000)
+    if piped:
+        question = (question or "Explain this and tell me how to fix it.") + \
+            "\n\nInput I was given:\n```\n" + piped + "\n```"
+
+    history = []
+    if question:
+        ask(key, model, history, question, context, can_run)
+        return 0
+
+    print(c("33;1", "Verity") + " is listening. Ask me anything about your system. (Ctrl-D to exit)")
+    while True:
+        try:
+            q = input(c("33", "you> ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if q in ("exit", "quit"):
+            return 0
+        if q:
+            ask(key, model, history, q, context, can_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

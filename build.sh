@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-VERSION="0.3.0-dev"
+VERSION="0.4.0"
 RELENG="${RELENG:-/usr/share/archiso/configs/releng}"
 WORK=./work
 OUT=./out
@@ -36,6 +36,11 @@ for d in syslinux grub efiboot; do
   grep -rlI "Arch Linux" "$PROFILE/$d" | xargs -r sed -i 's/Arch Linux/Verity OS/g' || true
 done
 
+# boot menu logo (BIOS syslinux splash) - replaces the Arch logo
+if [[ -d "$PROFILE/syslinux" && -f branding/splash.png ]]; then
+  cp branding/splash.png "$PROFILE/syslinux/splash.png"
+fi
+
 echo "==> Adding packages…"
 grep -vE '^\s*(#|$)' overlay/packages.verity >> "$PROFILE/packages.x86_64"
 sort -u -o "$PROFILE/packages.x86_64" "$PROFILE/packages.x86_64"
@@ -48,6 +53,8 @@ file_permissions+=(
   ["/usr/local/bin/verity"]="0:0:755"
   ["/usr/local/bin/verityfetch"]="0:0:755"
   ["/usr/local/bin/verity-install"]="0:0:755"
+  ["/usr/local/bin/verity-ask"]="0:0:755"
+  ["/usr/local/bin/verity-setup-desktop"]="0:0:755"
 )
 PERMS
 

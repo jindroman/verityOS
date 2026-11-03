@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # verity — a friendlier front-end for pacman (Verity OS)
-# Draft v0.3: wraps pacman/snapper. Does NOT replace the Arch package ecosystem.
+# Draft v0.4: wraps pacman/snapper. Does NOT replace the Arch package ecosystem.
 set -uo pipefail
 
-VERSION="0.3.0-dev"
+VERSION="0.4.0"
 Y=$'\e[38;5;220m'; G=$'\e[32m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
 say()  { printf '%sverity%s %s\n' "$Y" "$N" "$*"; }
 ok()   { printf ' %s✓%s %s\n' "$G" "$N" "$*"; }
@@ -159,12 +159,14 @@ cmd_doctor() {
   echo
   if [[ $problems -eq 0 ]]; then ok "All good."
   else warn "$problems problem$([[ $problems -gt 1 ]] && echo s) detected"
-       echo "${D}   (Explaining and fixing problems automatically is a planned Verity AI feature.)${N}"; fi
+       echo "${D}   Not sure what that means? Ask the AI helper:  verity doctor | verity ask \"explain this\"${N}"; fi
 }
 
 cmd_ask() {
-  say "Verity AI isn't built yet — this command is a placeholder."
-  echo "  You asked: $*"
+  if command -v verity-ask >/dev/null 2>&1; then
+    exec verity-ask "$@"
+  fi
+  say "The AI helper (verity-ask) isn't installed on this system."
   echo "  For now: verity doctor | verity search <term> | verity help"
 }
 
@@ -180,7 +182,7 @@ ${Y}Verity OS${N} — package & system helper  (v$VERSION)
   sudo verity clean              clear package cache, offer to remove orphans
   sudo verity rollback           restore a snapshot (experimental)
   verity doctor                  check kernel, network, audio, GPU, services…
-  verity ask "<question>"        placeholder for the future Verity AI
+  verity ask "<question>"        ask the Verity AI helper (first time: verity ask --setup)
 
 Verity is a thin layer on top of pacman — pacman still works as normal.
 HELP
@@ -195,7 +197,7 @@ case "$CMD" in
   clean)          cmd_clean "$@" ;;
   rollback)       cmd_rollback "$@" ;;
   doctor)         cmd_doctor ;;
-  ask)            cmd_ask "$@" ;;
+  ask|ai)         cmd_ask "$@" ;;
   version|-v|--version) echo "verity $VERSION" ;;
   help|-h|--help) cmd_help ;;
   *) say "unknown command: $CMD"; echo; cmd_help; exit 1 ;;

@@ -505,6 +505,20 @@ do_bootloader() {
   sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Verity OS"/; s/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=3/' "$MNT/etc/default/grub"
   sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"/' "$MNT/etc/default/grub"
 
+  # Verity logo as the GRUB menu background
+  if [[ -f /usr/share/verity/grub-background.png ]]; then
+    install -Dm644 /usr/share/verity/grub-background.png "$MNT/boot/grub/verity.png"
+    cat >> "$MNT/etc/default/grub" <<'GRUBCFG'
+
+# Verity OS look
+GRUB_BACKGROUND="/boot/grub/verity.png"
+GRUB_GFXMODE=auto
+GRUB_GFXPAYLOAD_LINUX=keep
+GRUB_COLOR_NORMAL="white/black"
+GRUB_COLOR_HIGHLIGHT="black/yellow"
+GRUBCFG
+  fi
+
   if (( UEFI )); then
     # normal entry (registers a boot menu item) ...
     arch-chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=VerityOS --recheck >>"$LOG" 2>&1 \

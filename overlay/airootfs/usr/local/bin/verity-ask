@@ -1,54 +1,63 @@
 #!/usr/bin/env python3
-"""verity-ask - the Verity OS AI helper (v0.1)
+"""verity-ask - the Verity OS AI helper (v0.2). No API key needed.
+
+It answers using, in this order:
+  1. local AI    a small open model running on YOUR PC (via Ollama)
+                 set it up once:  verity ask --install-ai
+  2. cloud AI    Claude, only if you saved an API key:  verity ask --setup
+  3. built-in    an offline knowledge base - instant, always available
 
 Usage:
   verity ask "how do I connect to wifi?"     one question
   verity ask                                 interactive chat
   some-command 2>&1 | verity ask "why?"      explain piped output
-  verity ask --setup                         store your API key
-  verity ask --show-context                  show what system info is sent
+  verity ask --install-ai                    install the local AI (free, private)
+  verity ask --status                        show which helpers are available
+  verity ask --setup                         (optional) save a cloud API key
+  verity ask --offline | --local | --cloud   force one helper
+  verity ask --show-context                  show the system info that is shared
   verity ask --no-run                        never offer to run commands
 
-The helper never runs anything without asking you first.
-Only a small system summary (see --show-context) plus what you type is sent.
+Nothing is ever run without asking you first.
 """
+import difflib
 import getpass
 import json
 import os
 import re
 import subprocess
 import sys
+import textwrap
+import time
 import urllib.error
 import urllib.request
 
 try:
-    import readline  # noqa: F401  (nicer line editing in chat mode)
+    import readline  # noqa: F401
 except ImportError:
     pass
 
+OLLAMA = os.environ.get("VERITY_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 API_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_CLOUD_MODEL = "claude-sonnet-5-5"
 USER_CONF = os.path.expanduser("~/.config/verity/ai.conf")
 SYS_CONF = "/etc/verity/ai.conf"
 
+# (minimum RAM in GB, ollama model, download size)
+LOCAL_TIERS = [(0, "qwen2.5:0.5b", "0.4 GB"), (3, "qwen2.5:1.5b", "1 GB"), (7, "qwen2.5:3b", "1.9 GB")]
+PREFER = ["qwen2.5:3b", "qwen2.5:1.5b", "llama3.2:3b", "llama3.2:1b", "gemma3:1b", "qwen2.5:0.5b"]
+
 SYSTEM_PROMPT = """You are Verity, the friendly assistant built into Verity OS, an Arch-based Linux distribution.
-Be concise and clear; many users are new to Linux.
-When commands are needed, put each step in a ```bash fenced block and briefly explain what it does.
+Be concise (under about 150 words) and clear; many users are new to Linux.
+When commands are needed, put each step in a ```bash fenced block and briefly say what it does.
 Prefer Verity commands over raw pacman: verity install/remove/update/search/doctor/clean/history/rollback.
 Never suggest destructive commands (rm -rf, dd, mkfs, partitioning) unless the user explicitly asked, and explain the risk first.
-If you are unsure, say so instead of guessing. The system summary below describes the user's machine."""
+If you are not sure, say so instead of guessing. Reply in the same language the user writes in."""
 
 DANGEROUS = [
-    r"\brm\s+-[a-zA-Z]*[rf]",
-    r"\bdd\s+.*of=/dev/",
-    r"\bmkfs",
-    r"\bwipefs",
-    r"\b(fdisk|parted|sgdisk|cfdisk)\b",
-    r">\s*/dev/(sd|nvme|vd)",
-    r"chmod\s+-R\s+777",
-    r"(curl|wget)[^|]*\|\s*(sudo\s+)?(ba)?sh",
-    r"pacman\s+.*-R[a-z]*dd",
-    r":\(\)\s*\{",
+    r"\brm\s+-[a-zA-Z]*[rf]", r"\bdd\s+.*of=/dev/", r"\bmkfs", r"\bwipefs",
+    r"\b(fdisk|parted|sgdisk|cfdisk)\b", r">\s*/dev/(sd|nvme|vd)", r"chmod\s+-R\s+777",
+    r"(curl|wget)[^|]*\|\s*(sudo\s+)?(ba)?sh", r"pacman\s+.*-R[a-z]*dd", r":\(\)\s*\{",
 ]
 
 USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -62,7 +71,7 @@ class AIError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- config
+# =============================================================== config
 def load_conf():
     conf = {}
     for path in (SYS_CONF, USER_CONF):
@@ -70,40 +79,53 @@ def load_conf():
             with open(path) as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    conf[k.strip()] = v.strip().strip("\"'")
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        conf[k.strip()] = v.strip().strip("\"'")
         except OSError:
             pass
-    for k in ("ANTHROPIC_API_KEY", "VERITY_AI_MODEL"):
+    for k in ("ANTHROPIC_API_KEY", "VERITY_AI_MODEL", "VERITY_AI_BACKEND", "VERITY_LOCAL_MODEL"):
         if os.environ.get(k):
             conf[k] = os.environ[k]
     return conf
 
 
-def setup():
-    print(c("33;1", "Verity AI setup"))
-    print("Verity talks to Claude through the Anthropic API.")
-    print("Get a key at https://console.anthropic.com (API usage is billed separately")
-    print("from a Claude chat subscription).\n")
+def save_conf(updates):
+    conf = {}
     try:
-        key = getpass.getpass("Paste your API key (input is hidden): ").strip()
+        with open(USER_CONF) as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    conf[k] = v
+    except OSError:
+        pass
+    conf.update(updates)
+    os.makedirs(os.path.dirname(USER_CONF), mode=0o700, exist_ok=True)
+    fd = os.open(USER_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for k, v in conf.items():
+            f.write(f"{k}={v}\n")
+
+
+def setup_cloud():
+    print(c("33;1", "Cloud AI setup (optional)"))
+    print("Verity already works without this. If you want Claude's cloud answers too,")
+    print("paste an Anthropic API key (console.anthropic.com; billed separately).\n")
+    try:
+        key = getpass.getpass("API key (hidden, empty to cancel): ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return 1
     if not key:
-        print("No key entered, nothing saved.")
+        print("Nothing saved.")
         return 1
-    os.makedirs(os.path.dirname(USER_CONF), mode=0o700, exist_ok=True)
-    fd = os.open(USER_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(f"ANTHROPIC_API_KEY={key}\n")
-    print(f"Saved to {USER_CONF} (readable only by you). Try: verity ask \"hello\"")
+    save_conf({"ANTHROPIC_API_KEY": key})
+    print(f"Saved to {USER_CONF} (readable only by you).")
     return 0
 
 
-# ---------------------------------------------------------------- context
+# =============================================================== system context
 def sh(cmd, limit=600):
     try:
         out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5).stdout
@@ -113,58 +135,765 @@ def sh(cmd, limit=600):
 
 
 def gather_context():
-    lines = [
+    failed = sh("systemctl --failed --no-legend --plain 2>/dev/null | head -n 8")
+    return "\n".join([
         "OS: " + (sh("grep -m1 PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d '\"'") or "Verity OS"),
         "Kernel: " + sh("uname -r"),
         "Desktop: " + (os.environ.get("XDG_CURRENT_DESKTOP") or "none/tty")
         + " (" + (os.environ.get("XDG_SESSION_TYPE") or "unknown") + ")",
         "Root disk: " + sh("df -h / | tail -n 1"),
         "Memory: " + sh("free -h | sed -n 2p"),
-    ]
-    failed = sh("systemctl --failed --no-legend --plain 2>/dev/null | head -n 8")
-    lines.append("Failed services: " + (failed.replace("\n", "; ") if failed else "none"))
-    return "\n".join(lines)
+        "Failed services: " + (failed.replace("\n", "; ") if failed else "none"),
+    ])
 
 
-# ---------------------------------------------------------------- API
+def mem_gb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1048576
+    except OSError:
+        pass
+    return 4.0
+
+
+# =============================================================== built-in knowledge base
+BRAIN = []
+
+
+def topic(title, keys, text):
+    BRAIN.append({"title": title, "keys": [k.strip() for k in keys.split(",") if k.strip()],
+                  "text": textwrap.dedent(text).strip("\n")})
+
+
+topic("Hello / what can I do", "hello, hi, hey, who are you, what can you do, what are you, how do you work, help me", """
+    Hi! I'm Verity, the helper built into Verity OS. I can explain how to do things and give you
+    commands (I always ask before running anything). Try asking:
+      - how do I connect to wifi?
+      - install firefox
+      - my sound doesn't work
+      - the disk is full
+      - how do I update?
+    For smarter, free answers that run on your own PC, run:  verity ask --install-ai
+""")
+
+topic("Connect to Wi-Fi", "wifi, wireless, connect wifi, connect to wifi, wifi password, join network, ssid, wlan", """
+    On the installed system (NetworkManager):
+    ```bash
+    nmcli device wifi list
+    ```
+    ```text
+    nmcli device wifi connect "NetworkName" password "YourPassword"
+    ```
+    In the live installer (iwd):
+    ```text
+    iwctl station wlan0 scan
+    iwctl station wlan0 get-networks
+    iwctl --passphrase "YourPassword" station wlan0 connect "NetworkName"
+    ```
+    If there's no wifi adapter at all, plug in an Ethernet cable - it works automatically.
+""")
+
+topic("No internet", "no internet, internet not working, cant connect, network not working, offline, no connection, dns, ping", """
+    Let's check each layer:
+    ```bash
+    ip a
+    ping -c 3 1.1.1.1
+    ping -c 3 archlinux.org
+    nmcli device status
+    ```
+    If the first ping works but the second doesn't, it's a DNS problem. Restart networking:
+    ```bash
+    sudo systemctl restart NetworkManager
+    ```
+    Still stuck? Run `verity doctor` for a full check.
+""")
+
+topic("Slow internet", "slow internet, slow wifi, slow download, speed, wifi slow, lag, bandwidth", """
+    Measure your real speed, and check your Wi-Fi signal:
+    ```bash
+    curl -o /dev/null -w 'speed: %{speed_download} bytes/s\\n' https://speed.cloudflare.com/__down?bytes=50000000
+    iw dev | head -n 5
+    ```
+    Tips: move closer to the router, use the 5 GHz network, or use an Ethernet cable.
+    Slow package downloads? Ask me about "slow mirrors".
+""")
+
+topic("Install a program", "install, install program, install app, install software, get program, add program, download app, package", """
+    Use verity (a friendly wrapper around pacman). Search first, then install:
+    ```text
+    verity search firefox
+    sudo verity install firefox
+    ```
+    Can't find it? It may be in the AUR or on Flathub - ask me about "AUR" or "flatpak".
+""")
+
+topic("Remove a program", "remove, uninstall, delete program, delete app, remove program, get rid of", """
+    ```text
+    sudo verity remove programname
+    ```
+    This also removes dependencies nothing else needs. To see what you installed recently:
+    ```bash
+    verity history 20
+    ```
+""")
+
+topic("Update the system", "update, upgrade, update system, update everything, new version, keep up to date, outdated", """
+    One command updates everything (it takes a snapshot first if your disk supports it):
+    ```bash
+    sudo verity update
+    ```
+    Do this regularly, and reboot after kernel updates.
+""")
+
+topic("Something broke after an update", "broke after update, update broke, broken, rollback, undo update, revert, restore, downgrade", """
+    First see what changed, then check system health:
+    ```bash
+    verity history 30
+    verity doctor
+    ```
+    If snapshots are set up (btrfs + snapper) you can go back:
+    ```bash
+    sudo verity rollback
+    ```
+    Tell me what exactly stopped working (sound? desktop? wifi?) and I can be more specific.
+""")
+
+topic("Disk is full", "disk full, no space, out of space, free space, storage, low disk, clean up, cleanup, disk space", """
+    See how full it is, clean the package cache and unused packages, and find the big folders:
+    ```bash
+    df -h /
+    sudo verity clean
+    sudo du -xh / --max-depth=1 2>/dev/null | sort -h | tail -n 12
+    ```
+    Old system logs can also be large:
+    ```bash
+    journalctl --disk-usage
+    sudo journalctl --vacuum-size=200M
+    ```
+""")
+
+topic("No sound", "no sound, sound, audio, speakers, volume, mute, muted, headphones, microphone, mic, pipewire", """
+    Check the audio system, restart it, and make sure nothing is muted:
+    ```bash
+    wpctl status
+    systemctl --user restart pipewire pipewire-pulse wireplumber
+    wpctl set-mute @DEFAULT_AUDIO_SINK@ 0
+    wpctl set-volume @DEFAULT_AUDIO_SINK@ 70%
+    ```
+    For a graphical volume mixer:  sudo verity install pavucontrol
+    In a virtual machine, make sure the VM has an audio device enabled.
+""")
+
+topic("Bluetooth", "bluetooth, bluetoth, pair, pairing, wireless headphones, bluetooth speaker, bluetooth mouse", """
+    ```text
+    sudo verity install bluez bluez-utils
+    ```
+    ```bash
+    sudo systemctl enable --now bluetooth
+    ```
+    Then pair in the interactive tool:
+    ```text
+    bluetoothctl
+    power on
+    scan on
+    pair XX:XX:XX:XX:XX:XX
+    connect XX:XX:XX:XX:XX:XX
+    ```
+    KDE has a Bluetooth page in System Settings that does all this with clicks.
+""")
+
+topic("Screen resolution / display", "resolution, screen resolution, display, monitor, screen size, scale, scaling, too small, too big, refresh rate", """
+    Hyprland: list monitors, then edit the monitor line in ~/.config/hypr/hyprland.conf:
+    ```bash
+    hyprctl monitors
+    ```
+    ```text
+    monitor = HDMI-A-1, 1920x1080@60, 0x0, 1
+    ```
+    KDE Plasma: System Settings > Display & Monitor.
+    In VirtualBox the resolution only adjusts if guest tools run - ask me about "virtualbox".
+""")
+
+topic("Keyboard layout", "keyboard, keyboard layout, keymap, wrong keys, czech keyboard, change keyboard, layout, qwertz, azerty", """
+    Find your layout name, then set it:
+    ```bash
+    localectl list-keymaps | grep -i cz
+    ```
+    ```text
+    sudo localectl set-keymap cz-qwertz
+    sudo localectl set-x11-keymap cz
+    ```
+    Hyprland: set  kb_layout = cz  in the input { } block of ~/.config/hypr/hyprland.conf.
+    KDE: System Settings > Keyboard.
+""")
+
+topic("Language / locale", "language, locale, change language, czech language, translate system, system language", """
+    Enable the locale in /etc/locale.gen (remove the # in front of it), generate it, set it:
+    ```text
+    sudo nano /etc/locale.gen
+    sudo locale-gen
+    sudo localectl set-locale LANG=cs_CZ.UTF-8
+    ```
+    Log out and back in to apply it.
+""")
+
+topic("Time and time zone", "time, timezone, time zone, clock, wrong time, date, ntp, sync time", """
+    ```bash
+    timedatectl
+    timedatectl list-timezones | grep -i prague
+    sudo timedatectl set-ntp true
+    ```
+    ```text
+    sudo timedatectl set-timezone Europe/Prague
+    ```
+""")
+
+topic("Computer name (hostname)", "hostname, computer name, rename computer, machine name, change hostname", """
+    ```text
+    sudo hostnamectl set-hostname newname
+    ```
+    Reboot (or log out and in) for it to show everywhere.
+""")
+
+topic("Users and passwords", "user, add user, new user, create user, delete user, change password, passwd, username, account, sudo", """
+    ```text
+    sudo useradd -m -G wheel -s /bin/bash newuser
+    sudo passwd newuser
+    ```
+    Change your own password:  passwd
+    Delete a user and their files (careful, this erases their home folder):
+    ```text
+    sudo userdel -r olduser
+    ```
+    Members of the "wheel" group can use sudo.
+""")
+
+topic("Forgot my password", "forgot password, forgotten password, lost password, reset password, cant login, locked out", """
+    Boot the Verity live ISO, then mount your system and reset it:
+    ```text
+    lsblk -f
+    mount /dev/sdXn /mnt            (your root partition)
+    arch-chroot /mnt
+    passwd yourusername
+    exit
+    reboot
+    ```
+    Replace /dev/sdXn with your root partition from lsblk. Remove the ISO before rebooting.
+""")
+
+topic("Services (start, stop, enable)", "service, services, systemctl, start service, stop service, restart service, enable service, daemon, autostart", """
+    ```bash
+    systemctl --failed
+    ```
+    ```text
+    systemctl status NAME
+    sudo systemctl restart NAME
+    sudo systemctl enable --now NAME     (start now and on every boot)
+    sudo systemctl disable --now NAME
+    journalctl -u NAME -b
+    ```
+""")
+
+topic("Logs and errors", "logs, error, errors, log, journal, journalctl, crash, crashed, what went wrong, why did it fail, failed", """
+    The most useful places to look:
+    ```bash
+    journalctl -p 3 -xb --no-pager | tail -n 40
+    systemctl --failed
+    sudo dmesg --level=err,warn | tail -n 30
+    ```
+    Paste the output to me:   journalctl -p 3 -xb --no-pager | tail -n 40 | verity ask "explain this"
+""")
+
+topic("System information", "system info, specs, about my computer, cpu, ram, memory, gpu, graphics card, hardware, version, neofetch", """
+    ```bash
+    verityfetch
+    lscpu | head -n 15
+    free -h
+    lspci | grep -iE 'vga|3d'
+    ```
+""")
+
+topic("Install or change the desktop", "install desktop, change desktop, switch desktop, install kde, install plasma, install hyprland, desktop environment, gui, graphical", """
+    The desktop is installed by one script (it also turns on the graphical login):
+    ```text
+    sudo verity-setup-desktop kde "$USER"       KDE Plasma
+    sudo verity-setup-desktop hypr "$USER"      Hyprland (needs a real GPU / 3D)
+    ```
+    Then reboot. You can pick the session on the login screen.
+""")
+
+topic("Black screen / desktop won't start", "black screen, desktop wont start, no desktop, login screen, stuck, hyprland wont start, blank screen, sddm, wont boot into desktop", """
+    Press Ctrl+Alt+F3 for a text console, log in, and check the login manager:
+    ```bash
+    systemctl status sddm --no-pager
+    journalctl -b -u sddm --no-pager | tail -n 30
+    ```
+    ```text
+    sudo systemctl restart sddm
+    ```
+    Hyprland needs a real GPU with 3D. In a VM, install KDE instead:
+    ```text
+    sudo verity-setup-desktop kde "$USER"
+    ```
+""")
+
+topic("Boot problems / repair the bootloader", "wont boot, boot problem, boot repair, grub, grub rescue, bootloader, repair boot, cant boot, reinstall grub, no boot", """
+    Boot the Verity live ISO, mount your system, and reinstall the bootloader:
+    ```text
+    lsblk -f
+    mount /dev/sdXn /mnt                    (root partition)
+    mount /dev/sdXm /mnt/boot               (EFI partition, UEFI systems only)
+    arch-chroot /mnt
+    grub-install --target=x86_64-efi --efi-directory=/boot --removable      (UEFI)
+    grub-install --target=i386-pc /dev/sdX                                  (BIOS)
+    grub-mkconfig -o /boot/grub/grub.cfg
+    exit
+    ```
+    Replace the sdX names with yours from lsblk. Take care to pick the right partitions.
+""")
+
+topic("Mount a USB drive or disk", "mount, usb, usb drive, flash drive, external drive, external disk, unmount, eject, pendrive", """
+    ```bash
+    lsblk -f
+    ```
+    ```text
+    sudo mount /dev/sdb1 /mnt
+    sudo umount /mnt
+    ```
+    Use the device name from lsblk. On KDE, Dolphin mounts drives with one click.
+""")
+
+topic("Format a USB drive", "format usb, format drive, format disk, erase usb, wipe usb, make usb, partition, mkfs", """
+    Warning: this ERASES everything on the drive. Find the right device name first:
+    ```bash
+    lsblk
+    ```
+    ```text
+    sudo umount /dev/sdX1
+    sudo mkfs.vfat -F32 /dev/sdX1        (works everywhere)
+    sudo mkfs.ext4 /dev/sdX1             (Linux only)
+    ```
+    Triple-check sdX - picking your system disk by mistake destroys your data.
+""")
+
+topic("Find a file", "find file, find files, search file, locate, where is file, lost file, search for file", """
+    ```text
+    find ~ -iname "*partofname*"
+    ```
+    For instant search:  sudo verity install plocate  then  sudo updatedb  then  locate name
+""")
+
+topic("Computer is slow / what uses my CPU or RAM", "slow, computer slow, slow computer, laggy, high cpu, high ram, using memory, task manager, htop, top, freezing, performance", """
+    ```bash
+    ps aux --sort=-%mem | head -n 10
+    ps aux --sort=-%cpu | head -n 10
+    free -h
+    ```
+    For a live view:  sudo verity install btop  then  btop
+""")
+
+topic("Close a frozen app", "frozen app, app frozen, not responding, kill, kill app, force quit, force close, hung, stuck app", """
+    ```text
+    pkill -f appname
+    ```
+    Hyprland:  hyprctl kill  then click the window.   KDE: Ctrl+Alt+Esc then click the window.
+""")
+
+topic("Printers", "printer, print, printing, cups, scanner", """
+    ```text
+    sudo verity install cups
+    ```
+    ```bash
+    sudo systemctl enable --now cups
+    ```
+    Then open http://localhost:631 in a browser to add your printer.
+""")
+
+topic("Firewall", "firewall, ufw, ports, block, open port, security", """
+    ```text
+    sudo verity install ufw
+    sudo systemctl enable --now ufw
+    sudo ufw enable
+    ```
+    ```bash
+    sudo ufw status
+    ```
+""")
+
+topic("SSH (remote login)", "ssh, remote, remote login, openssh, sshd, connect remotely, remote access", """
+    ```text
+    sudo verity install openssh
+    ```
+    ```bash
+    sudo systemctl enable --now sshd
+    ip a
+    ```
+    From another computer:  ssh yourusername@that-computers-ip
+""")
+
+topic("NVIDIA graphics driver", "nvidia, nvidia driver, graphics driver, gpu driver, geforce, nouveau", """
+    Check you have an NVIDIA card, then install the driver and reboot:
+    ```bash
+    lspci | grep -i nvidia
+    ```
+    ```text
+    sudo verity install nvidia nvidia-utils
+    sudo reboot
+    ```
+    Hyprland on NVIDIA may also need the kernel option  nvidia-drm.modeset=1.
+""")
+
+topic("VirtualBox: resolution, 3D and clipboard", "virtualbox, vm, virtual machine, guest additions, guest tools, resolution in vm, vbox, shared clipboard", """
+    Guest tools make the resolution adjust automatically and enable the shared clipboard:
+    ```text
+    sudo verity install virtualbox-guest-utils
+    ```
+    ```bash
+    sudo systemctl enable --now vboxservice
+    ```
+    In the VM settings also tick Display > Enable 3D Acceleration and set video memory to the maximum.
+""")
+
+topic("AUR (community packages)", "aur, yay, makepkg, community package, package not found, build package, pkgbuild", """
+    The AUR holds community-made packages. Read a package's PKGBUILD before installing - they are not reviewed.
+    ```text
+    sudo verity install base-devel git
+    git clone https://aur.archlinux.org/yay.git
+    cd yay && makepkg -si
+    yay -S packagename
+    ```
+""")
+
+topic("Flatpak apps", "flatpak, flathub, sandbox, app store", """
+    ```text
+    sudo verity install flatpak
+    flatpak install flathub org.mozilla.firefox
+    flatpak run org.mozilla.firefox
+    ```
+    Log out and in once after installing flatpak so apps show up in the menu.
+""")
+
+topic("Package manager errors (keyring, lock)", "pacman error, keyring, signature, invalid signature, db.lck, lock file, unable to lock database, corrupted package, failed to commit", """
+    Is another update running? If not, the lock file is stale:
+    ```bash
+    pgrep -a pacman
+    ```
+    ```text
+    sudo rm /var/lib/pacman/db.lck       (only if nothing is running above)
+    ```
+    Signature or keyring errors:
+    ```text
+    sudo pacman -Sy archlinux-keyring
+    sudo pacman -Su
+    ```
+""")
+
+topic("Slow package downloads (mirrors)", "slow mirrors, slow download packages, mirror, mirrors, reflector, slow update, download slow", """
+    Pick the fastest mirrors:
+    ```text
+    sudo verity install reflector
+    sudo reflector --latest 20 --sort rate --save /etc/pacman.d/mirrorlist
+    ```
+""")
+
+topic("Screen brightness", "brightness, dim screen, screen too dark, screen too bright, backlight", """
+    ```text
+    sudo verity install brightnessctl
+    brightnessctl set 50%
+    ```
+    KDE has a brightness slider in the battery menu.
+""")
+
+topic("Dual boot with Windows", "dual boot, windows, dualboot, keep windows, windows missing, os-prober, boot windows", """
+    Make GRUB detect Windows:
+    ```text
+    sudo verity install os-prober
+    sudo nano /etc/default/grub       (set GRUB_DISABLE_OS_PROBER=false)
+    sudo grub-mkconfig -o /boot/grub/grub.cfg
+    ```
+    Note: the Verity installer erases the whole disk, so install on a separate disk to keep Windows.
+""")
+
+topic("Hyprland shortcuts (Verity Hypr)", "hyprland shortcuts, shortcuts, keybinds, key bindings, hyprland keys, how to use hyprland, hotkeys, open terminal", """
+    SUPER = the Windows key.
+      SUPER+Enter      terminal            SUPER+D     app launcher
+      SUPER+E          files               SUPER+Q     close window
+      SUPER+F          fullscreen          SUPER+V     floating on/off
+      SUPER+arrows     move focus          SUPER+1..4  workspaces
+      SUPER+Shift+M    exit Hyprland
+    Change them in ~/.config/hypr/hyprland.conf.
+""")
+
+topic("Take a screenshot", "screenshot, screen shot, capture screen, print screen, snip, screen capture", """
+    Hyprland:
+    ```text
+    sudo verity install grim slurp
+    grim -g "$(slurp)" ~/screenshot.png
+    ```
+    KDE: press Print Screen (Spectacle).
+""")
+
+topic("Install Verity OS to a disk", "install verity, install os, install to disk, installer, verity-install, install system, put on pc, install on computer", """
+    From the live ISO, run the installer (try the dry run first - it changes nothing):
+    ```text
+    sudo verity-install --dry-run
+    sudo verity-install
+    ```
+    It erases the whole disk you choose, so back up first.
+""")
+
+topic("Reboot or shut down", "reboot, restart, restart computer, shutdown, shut down, power off, poweroff, turn off", """
+    ```text
+    reboot
+    poweroff
+    ```
+""")
+
+topic("Smarter AI, local AI, API key", "smarter ai, better ai, local ai, offline ai, install ai, ollama, api key, ai model, chatgpt, llm, make you smarter", """
+    I always work offline with built-in knowledge. For smarter free answers, install a small AI
+    model that runs on your own PC (no account, no API key, nothing leaves your computer):
+    ```text
+    verity ask --install-ai
+    ```
+    It downloads about 0.4 to 2 GB once, depending on your RAM. Check what's active with:
+    ```bash
+    verity ask --status
+    ```
+""")
+
+# ---- matching ---------------------------------------------------------------
+_STOP = set("""a an the i is are am to do does did how can could would what why my me it of on in for and or with
+this that when where which be get make not no please want need there some any you your have has had was were
+just really very also so if then than too into out up down over again""".split())
+
+
+def _norm(s):
+    return s.lower().replace("wi-fi", "wifi").replace("wi fi", "wifi").replace("'", "").replace("\u2019", "")
+
+
+def _stem(w):
+    if len(w) > 5 and w.endswith("ing"):
+        return w[:-3]
+    if len(w) > 4 and w.endswith("ed"):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def _toks(s):
+    return [_stem(t) for t in re.findall(r"[a-z0-9]+(?:[-+.][a-z0-9]+)*", _norm(s)) if t not in _STOP]
+
+
+def _match(a, b):
+    return a == b or (min(len(a), len(b)) >= 4 and (a.startswith(b) or b.startswith(a)))
+
+
+for _e in BRAIN:
+    _e["_keys"] = [_toks(k) for k in _e["keys"]]
+    _e["_title"] = _toks(_e["title"])
+_VOCAB = sorted({t for e in BRAIN for k in e["_keys"] for t in k})
+
+
+def _fix_typos(qtoks):
+    out = []
+    for t in qtoks:
+        if len(t) >= 4 and not any(_match(t, v) for v in _VOCAB):
+            close = difflib.get_close_matches(t, _VOCAB, n=1, cutoff=0.8)
+            t = close[0] if close else t
+        out.append(t)
+    return out
+
+
+def brain_rank(question):
+    q = _fix_typos(_toks(question))
+    has = lambda t: any(_match(t, x) for x in q)
+    scored = []
+    for e in BRAIN:
+        s = 0.0
+        for k in e["_keys"]:
+            if len(k) == 1:
+                s += 1.5 if has(k[0]) else 0
+            elif k and all(has(t) for t in k):
+                s += 3
+        s += 0.5 * sum(1 for t in e["_title"] if has(t))
+        scored.append((s, e))
+    scored.sort(key=lambda x: -x[0])
+    return scored
+
+
+def brain_answer(question):
+    ranked = brain_rank(question)
+    top, best = ranked[0]
+    second = ranked[1][0]
+    if top >= 2.0 or (top >= 1.5 and top - second >= 1.0):   # clear single-keyword match
+        text = best["text"]
+        rel = [e["title"] for s, e in ranked[1:3] if s >= 2.0 and s >= 0.85 * top]
+        if rel:
+            text += "\n\n(Related: " + "; ".join(rel) + ")"
+        return text
+    close = [e["title"] for s, e in ranked[:3] if s > 0] or [e["title"] for e in BRAIN[1:4]]
+    return ("I'm not sure about that one - I'm the built-in helper, so my knowledge is limited.\n"
+            "Closest topics: " + "; ".join(close) + ".\n"
+            "Try rephrasing, run `verity doctor`, or install the smarter local AI:  verity ask --install-ai")
+
+
+def brain_notes(question, n=2):
+    return [e for s, e in brain_rank(question)[:n] if s >= 2.0]
+
+
+# =============================================================== local AI (Ollama)
+def _http(url, payload=None, timeout=5):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def ollama_models():
+    """List of installed model names; None when the Ollama server isn't running."""
+    try:
+        with _http(OLLAMA + "/api/tags", timeout=1.5) as r:
+            return [m.get("name", "") for m in json.load(r).get("models", [])]
+    except Exception:
+        return None
+
+
+def pick_local_model(conf, models):
+    want = conf.get("VERITY_LOCAL_MODEL")
+    if want and want in models:
+        return want
+    for p in PREFER:
+        if p in models:
+            return p
+    return models[0]
+
+
+def ask_local(model, system, messages):
+    payload = {"model": model, "stream": True,
+               "messages": [{"role": "system", "content": system}] + messages,
+               "options": {"temperature": 0.3, "num_predict": 500, "num_ctx": 4096}}
+    out = []
+    try:
+        with _http(OLLAMA + "/api/chat", payload, timeout=600) as r:
+            for line in r:
+                if not line.strip():
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("error"):
+                    raise AIError(chunk["error"])
+                piece = chunk.get("message", {}).get("content", "")
+                if piece:
+                    out.append(piece)
+                    print(piece, end="", flush=True)
+                if chunk.get("done"):
+                    break
+    except urllib.error.HTTPError as e:
+        raise AIError(f"local AI error {e.code} (is the model installed? verity ask --install-ai)")
+    except (urllib.error.URLError, OSError) as e:
+        raise AIError(f"local AI not reachable: {e}")
+    print()
+    text = "".join(out).strip()
+    if not text:
+        raise AIError("local AI returned nothing")
+    return text
+
+
+def _sudo(cmd):
+    return subprocess.run(cmd if os.geteuid() == 0 else ["sudo"] + cmd)
+
+
+def install_ai(conf):
+    print(c("33;1", "Install the local Verity AI"))
+    if os.path.isdir("/run/archiso"):
+        print("You're in the live installer, where everything lives in RAM and is lost on reboot.")
+        print("Install Verity OS to your disk first, then run:  verity ask --install-ai")
+        return 1
+    ram = mem_gb()
+    _, model, size = [t for t in LOCAL_TIERS if ram >= t[0]][-1]
+    print(f"\nThis computer has about {ram:.1f} GB of RAM, so I'd pick the model:  {c('1', model)}")
+    print(f"  - one-time download: about {size} (plus ~13 MB for the Ollama program)")
+    print("  - runs on your own computer: free, private, no account, no API key")
+    print("  - on older computers answers take a few seconds to appear")
+    print("  - the built-in helper keeps working either way\n")
+    try:
+        if input("Download and install now? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+            print("Cancelled.")
+            return 0
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+    try:
+        urllib.request.urlopen("https://archlinux.org", timeout=6)
+    except Exception:
+        print(c("31", "No internet connection. Connect first (verity ask \"connect to wifi\"), then try again."))
+        return 1
+    if _sudo(["pacman", "-S", "--needed", "--noconfirm", "ollama"]).returncode != 0:
+        print(c("31", "Could not install Ollama."))
+        return 1
+    _sudo(["systemctl", "enable", "--now", "ollama"])
+    print("Waiting for the AI service to start...", end="", flush=True)
+    for _ in range(30):
+        if ollama_models() is not None:
+            break
+        time.sleep(1)
+        print(".", end="", flush=True)
+    print()
+    if ollama_models() is None:
+        print(c("31", "The AI service didn't start. Check: systemctl status ollama"))
+        return 1
+    print(f"Downloading {model} ...")
+    if subprocess.run(["ollama", "pull", model]).returncode != 0:
+        print(c("31", "Model download failed. Run `verity ask --install-ai` again to resume."))
+        return 1
+    save_conf({"VERITY_LOCAL_MODEL": model, "VERITY_AI_BACKEND": "auto"})
+    print(c("32;1", "\nDone.") + f" Verity now answers with {model} running on this computer.")
+    print('Try:  verity ask "why is my computer slow?"')
+    return 0
+
+
+# =============================================================== cloud AI (optional)
 def call_api(key, model, system, messages):
-    body = json.dumps({
-        "model": model,
-        "max_tokens": 1500,
-        "system": system,
-        "messages": messages,
-    }).encode()
+    body = json.dumps({"model": model, "max_tokens": 1500, "system": system, "messages": messages}).encode()
     req = urllib.request.Request(API_URL, data=body, headers={
-        "content-type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-    })
+        "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             data = json.load(r)
     except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = json.load(e).get("error", {}).get("message", "")
-        except Exception:
-            pass
         if e.code == 401:
-            raise AIError("The API key was rejected. Run: verity ask --setup")
+            raise AIError("the API key was rejected (verity ask --setup)")
         if e.code == 429:
-            raise AIError("Rate limited or out of credit. Try again shortly.")
-        raise AIError(f"API error {e.code}: {detail}")
+            raise AIError("cloud AI rate limited or out of credit")
+        raise AIError(f"cloud AI error {e.code}")
     except urllib.error.URLError:
-        raise AIError("Can't reach the API. Are you online?")
+        raise AIError("can't reach the cloud AI (offline?)")
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
 
-# ---------------------------------------------------------------- running commands
+# =============================================================== running commands
+def code_blocks(text):
+    """Only ```bash / ```sh fenced blocks are runnable; ```text blocks are examples."""
+    blocks, cur, lang = [], None, ""
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            if cur is None:
+                cur, lang = [], line.strip()[3:].strip().lower()
+            else:
+                if lang in ("bash", "sh", "shell"):
+                    blocks.append("\n".join(cur))
+                cur = None
+        elif cur is not None:
+            cur.append(line)
+    return blocks
+
+
 def is_dangerous(cmd):
     return any(re.search(p, cmd) for p in DANGEROUS)
 
 
 def tty_input(prompt):
-    """Read from the terminal even when stdin is a pipe."""
     try:
         with open("/dev/tty", "r+") as tty:
             tty.write(prompt)
@@ -175,8 +904,7 @@ def tty_input(prompt):
 
 
 def offer_to_run(reply):
-    blocks = re.findall(r"```(?:bash|sh|shell)?\n(.*?)```", reply, re.S)
-    for block in blocks:
+    for block in code_blocks(reply):
         cmd = block.strip()
         if not cmd:
             continue
@@ -188,44 +916,94 @@ def offer_to_run(reply):
         else:
             ans = tty_input("  Run this? [y/N/q to stop] ")
             ok = ans in ("y", "yes")
-        if ans is None:
-            return  # no terminal available
-        if ans == "q":
+        if ans is None or ans == "q":
             return
         if ok:
             subprocess.run(["bash", "-c", cmd])
 
 
-# ---------------------------------------------------------------- chat
-def ask(key, model, history, question, context, can_run):
+# =============================================================== answering
+def header(label):
+    print("\n" + c("33;1", "Verity") + c("2", f"  ({label})"))
+
+
+def respond(question, brain_q, context, conf, history, backends, can_run, tip_state):
     history.append({"role": "user", "content": question})
-    system = SYSTEM_PROMPT + "\n\nSystem summary:\n" + context
-    try:
-        reply = call_api(key, model, system, history[-20:])
-    except AIError as e:
-        history.pop()
-        print(c("31", f"verity: {e}"))
+    for b in backends:
+        try:
+            if b == "local":
+                models = ollama_models()
+                if not models:
+                    continue
+                model = pick_local_model(conf, models)
+                notes = brain_notes(brain_q)
+                system = SYSTEM_PROMPT + "\n\nSystem summary:\n" + context
+                if notes:
+                    system += "\n\nVerified reference notes for this OS (prefer them):\n" + \
+                              "\n\n".join(f"## {n['title']}\n{n['text']}" for n in notes)
+                header(f"local AI - {model}")
+                reply = ask_local(model, system, history[-12:])
+            elif b == "cloud":
+                key = conf.get("ANTHROPIC_API_KEY")
+                if not key:
+                    continue
+                header("cloud AI")
+                reply = call_api(key, conf.get("VERITY_AI_MODEL", DEFAULT_CLOUD_MODEL),
+                                 SYSTEM_PROMPT + "\n\nSystem summary:\n" + context, history[-12:])
+                print(reply.strip())
+            else:
+                header("built-in helper")
+                reply = brain_answer(brain_q)
+                print(reply)
+                if not tip_state["shown"] and ollama_models() is None:
+                    print(c("2", "\n  Tip: for smarter answers that run free on your PC:  verity ask --install-ai"))
+                    tip_state["shown"] = True
+        except AIError as e:
+            print(c("2", f"\n  ({b}: {e}) - trying the next helper"))
+            continue
+        history.append({"role": "assistant", "content": reply})
+        print()
+        if can_run:
+            offer_to_run(reply)
         return
-    history.append({"role": "assistant", "content": reply})
-    print("\n" + c("33;1", "Verity") + "\n" + reply.strip() + "\n")
-    if can_run:
-        offer_to_run(reply)
+    history.pop()
+    print(c("31", "verity: no helper available."))
+
+
+def status(conf):
+    models = ollama_models()
+    print(c("33;1", "Verity AI status"))
+    print(f"  built-in helper : {c('32', 'ready')}  ({len(BRAIN)} topics, offline)")
+    if models is None:
+        print("  local AI        : not running  ->  verity ask --install-ai")
+    elif not models:
+        print("  local AI        : Ollama running but no model  ->  verity ask --install-ai")
+    else:
+        print(f"  local AI        : {c('32', 'ready')}  ({pick_local_model(conf, models)})")
+    cloud = c("32", "key saved") if conf.get("ANTHROPIC_API_KEY") else "not set (optional)  ->  verity ask --setup"
+    print(f"  cloud AI        : {cloud}")
+    return 0
 
 
 def main(argv):
-    can_run = True
-    show_ctx = False
+    can_run, show_ctx, force = True, False, None
     words = []
     for a in argv[1:]:
         if a in ("-h", "--help"):
             print(__doc__)
             return 0
         elif a == "--setup":
-            return setup()
+            return setup_cloud()
+        elif a == "--install-ai":
+            return install_ai(load_conf())
+        elif a == "--status":
+            return status(load_conf())
         elif a == "--no-run":
             can_run = False
         elif a == "--show-context":
             show_ctx = True
+        elif a in ("--offline", "--local", "--cloud"):
+            force = a[2:]
         else:
             words.append(a)
 
@@ -235,28 +1013,21 @@ def main(argv):
         return 0
 
     conf = load_conf()
-    key = conf.get("ANTHROPIC_API_KEY")
-    model = conf.get("VERITY_AI_MODEL", DEFAULT_MODEL)
-    if not key:
-        print(c("33;1", "Verity isn't set up yet.") + " I need an API key first.")
-        if sys.stdin.isatty() and input("Set it up now? [Y/n] ").strip().lower() in ("", "y", "yes"):
-            if setup() != 0:
-                return 1
-            conf = load_conf()
-            key = conf.get("ANTHROPIC_API_KEY")
-        if not key:
-            print("Run: verity ask --setup")
-            return 1
+    choice = force or conf.get("VERITY_AI_BACKEND", "auto")
+    backends = {"local": ["local"], "cloud": ["cloud"], "offline": ["offline"]}.get(choice, ["local", "cloud", "offline"])
+    if force in ("local", "cloud"):
+        backends = [force, "offline"]
 
     question = " ".join(words).strip()
     piped = "" if sys.stdin.isatty() else sys.stdin.read(20000)
+    brain_q = question or piped[:400]
     if piped:
         question = (question or "Explain this and tell me how to fix it.") + \
             "\n\nInput I was given:\n```\n" + piped + "\n```"
 
-    history = []
+    history, tip = [], {"shown": False}
     if question:
-        ask(key, model, history, question, context, can_run)
+        respond(question, brain_q, context, conf, history, backends, can_run, tip)
         return 0
 
     print(c("33;1", "Verity") + " is listening. Ask me anything about your system. (Ctrl-D to exit)")
@@ -269,7 +1040,7 @@ def main(argv):
         if q in ("exit", "quit"):
             return 0
         if q:
-            ask(key, model, history, q, context, can_run)
+            respond(q, q, context, conf, history, backends, can_run, tip)
 
 
 if __name__ == "__main__":

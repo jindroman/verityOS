@@ -182,7 +182,7 @@ ${Y}Verity OS${N} — package & system helper  (v$VERSION)
   sudo verity clean              clear package cache, offer to remove orphans
   sudo verity rollback           restore a snapshot (experimental)
   verity doctor                  check kernel, network, audio, GPU, services…
-  verity ask "<question>"        ask the Verity AI helper (first time: verity ask --setup)
+  verity ask "<question>"        ask the Verity AI helper (works offline; smarter: verity ask --install-ai)
 
 Verity is a thin layer on top of pacman — pacman still works as normal.
 HELP

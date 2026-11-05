@@ -138,6 +138,8 @@ Eventually, Verity should be able to explain what went wrong and offer to fix it
 
 Verity OS is planned around a snapshot-based system.
 
+> **Status:** `verity update` / `verity install` already try to snapshot first, but the current installer doesn't set up btrfs + snapper yet — the snapshot step is skipped with a warning.
+
 Before major updates:
 
 ```text
@@ -264,25 +266,25 @@ New users should have Verity there to explain what everything means.
 
 ## 🚧 Current Status
 
-**Early development — first buildable ISO draft (v0.3.0-dev). Not yet boot-tested on real hardware.**
+**Early development — v0.4.3. The ISO builds in CI, boots and installs in a VM (VirtualBox); not yet tested on real hardware.**
 
 Currently being worked on:
 
 * [x] Verity branding
 * [x] Verity ASCII logo
-* [x] Verity OS web prototype
+* [x] Verity OS web prototype (early draft, no longer in the repo)
 * [x] Initial CLI concept
 * [x] Package manager concept
 * [x] Desktop concepts
-* [ ] Real Arch-based ISO — 🚧 archiso build profile in repo (`build.sh`), awaiting first boot test
-* [ ] Real `verity` package manager — 🚧 draft CLI wrapping pacman (`verity install/remove/update/search/history/clean`)
-* [ ] Hyprland profile — 🚧 draft package list + starter config
-* [ ] KDE profile — 🚧 draft package list
+* [x] Real Arch-based ISO — archiso build profile (`build.sh`) + CI release workflow, booted in a VM
+* [x] Real `verity` package manager — CLI wrapping pacman (`verity install/remove/update/search/history/clean/rollback`)
+* [x] Hyprland profile — package list + starter config
+* [x] KDE profile — package list
 * [ ] 3D Verity orb
 * [ ] AI voice
-* [ ] System diagnostics — 🚧 basic `verity doctor`
-* [ ] Snapshot/rollback system — 🚧 experimental (btrfs + snapper)
-* [ ] Installer — 🚧 draft terminal installer (`verity-install`)
+* [x] System diagnostics — basic `verity doctor`
+* [ ] Snapshot/rollback system — not wired up yet (installer uses ext4; `verity rollback` needs btrfs + snapper)
+* [x] Installer — terminal installer (`verity-install`), dry-run supported
 * [ ] Verity repositories
 
 ---
@@ -294,7 +296,7 @@ Currently being worked on:
 ### 1. Build the ISO
 
 **Option A — GitHub Actions (no Arch machine needed).**
-Go to **Actions → Build Verity OS ISO → Run workflow**, or push a tag like `v0.3.0`.
+Go to **Actions → Build Verity OS ISO → Run workflow**, or push a tag like `v0.4.3`.
 The finished ISO is attached to the run (and to the Release, for tags).
 
 **Option B — on Arch Linux (or an `archlinux` container):**
@@ -302,8 +304,10 @@ The finished ISO is attached to the run (and to the Release, for tags).
 ```bash
 sudo pacman -S archiso
 sudo ./build.sh
-# → out/verityos-0.3.0-dev-x86_64.iso  (+ SHA256SUMS)
+# → out/verityos-<version>-x86_64.iso  (+ SHA256SUMS)
 ```
+
+The version comes from the `VERSION` file (CI overrides it with the git tag).
 
 ### 2. Try it in a VM
 
@@ -326,13 +330,13 @@ verity-install --dry-run  # walk the menus, change nothing, print the commands
 
 The installer will:
 
-1. Check boot mode (UEFI/BIOS) and internet
+1. Check boot mode (UEFI/BIOS) and internet (with a Wi-Fi fallback)
 2. Let you pick a disk (the live USB is hidden) and make you type its name to confirm
 3. Let you choose **Verity Hypr**, **Verity Desktop** (KDE) or **Terminal only**
-4. Ask for hostname, user, password, time zone, locale and keyboard
-5. Partition (GPT), format btrfs with `@`, `@home`, `@snapshots`, `@log`
+4. Ask for keymap, hostname, time zone, username and password
+5. Partition (GPT): 1 GiB FAT32 boot (UEFI) or bios_grub (BIOS), rest ext4 root
 6. Install Arch base + your desktop with `pacstrap`, then Verity tools & branding
-7. Install GRUB and (best effort) set up snapper snapshots
+7. Install GRUB (UEFI: boot entry + fallback path so VirtualBox still boots)
 
 A log is written to `/tmp/verity-install.log`.
 
@@ -347,13 +351,15 @@ sudo dd if=out/verityos-*.iso of=/dev/sdX bs=4M status=progress oflag=sync   # d
 ### Repository layout
 
 ```text
+VERSION                  current version number (CI overrides it from the git tag)
 build.sh                 builds the ISO from Arch's archiso "releng" profile + overlay/
 test-vm.sh               boots the ISO in QEMU
 overlay/
   packages.verity        extra packages for the live ISO
   airootfs/              files copied into the live system
-    usr/local/bin/       verity, verityfetch, verity-install
+    usr/local/bin/       verity, verity-ask, verityfetch, verity-install, verity-setup-desktop
     usr/share/verity/    logo, os-release, desktop profiles
+    etc/pacman.d/hooks/  re-applies Verity branding after pacman updates
 .github/workflows/       CI that builds the ISO
 ```
 
@@ -361,27 +367,13 @@ overlay/
 
 Don't commit `.iso` files with Git LFS and expect "Download ZIP" to include them — GitHub's ZIP only contains the tiny LFS *pointer* file. Publish ISOs as **GitHub Releases** assets (the workflow above does this for tags).
 
-### Known limitations (v0.3.0-dev)
+### Known limitations (v0.4.3)
 
-* Untested on real hardware; first VM boot test still pending
-* `verity rollback` and snapshots are experimental
-* `verity ask`, the 3D orb and the AI voice are **not implemented yet** (placeholders only)
+* Boots and installs in a VM; not yet tested on real hardware
+* The installer creates a single **ext4** root partition — btrfs subvolumes, snapshots and `verity rollback` are **not set up yet** (rollback reports this and exits)
+* `verity ask` works offline via its built-in knowledge base (and can use Ollama/Claude if you set it up); the 3D orb and AI voice are **not implemented yet**
 * x86_64 only; no Secure Boot support; no disk encryption yet
 * Hyprland profile is minimal; KDE profile is stock Plasma
-
----
-
-## 🧪 Prototype
-
-The repository currently contains an HTML prototype demonstrating the visual direction of Verity OS.
-
-Open:
-
-```text
-verity_os.html
-```
-
-in a browser to see it.
 
 ---
 

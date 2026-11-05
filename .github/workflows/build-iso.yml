@@ -23,6 +23,11 @@ jobs:
       - name: Build ISO
         run: |
           chmod +x build.sh
+          # On a tag build (v1.2.3) the tag is the single source of truth for the version
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "Building Verity OS ${VERSION:-<from VERSION file>}"
           ./build.sh
 
       - name: Upload artifact
@@ -40,4 +45,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" out/*.iso out/SHA256SUMS --repo "${{ github.repository }}" --title "Verity OS ${{ github.ref_name }}" --generate-notes
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          # Idempotent: re-running the workflow updates the existing release
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/*.iso out/SHA256SUMS --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" out/*.iso out/SHA256SUMS --repo "$REPO" \
+              --title "Verity OS $TAG" --generate-notes
+          fi

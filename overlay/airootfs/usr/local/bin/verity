@@ -3,7 +3,7 @@
 # Draft v0.4: wraps pacman/snapper. Does NOT replace the Arch package ecosystem.
 set -uo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.3"
 Y=$'\e[38;5;220m'; G=$'\e[32m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
 say()  { printf '%sverity%s %s\n' "$Y" "$N" "$*"; }
 ok()   { printf ' %s✓%s %s\n' "$G" "$N" "$*"; }
@@ -99,7 +99,7 @@ cmd_clean() {
 
 cmd_rollback() {
   need_root "$@"
-  have_snapper || { bad "No snapshots available (needs btrfs + snapper set up by the installer)."; exit 1; }
+  have_snapper || { bad "No snapshots available — the current installer uses ext4, so btrfs + snapper are not set up yet."; exit 1; }
   say "rollback is EXPERIMENTAL in this draft. Available snapshots:"; echo
   snapper -c root list
   echo
@@ -180,7 +180,7 @@ ${Y}Verity OS${N} — package & system helper  (v$VERSION)
   verity search <term>           search the repositories
   verity history [N]             last N package changes (default 30)
   sudo verity clean              clear package cache, offer to remove orphans
-  sudo verity rollback           restore a snapshot (experimental)
+  sudo verity rollback           restore a snapshot (needs btrfs + snapper — not set up yet)
   verity doctor                  check kernel, network, audio, GPU, services…
   verity ask "<question>"        ask the Verity AI helper (works offline; smarter: verity ask --install-ai)
 

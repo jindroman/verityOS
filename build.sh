@@ -7,7 +7,13 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-VERSION="0.4.0"
+# Version: $VERSION env (CI passes the git tag) > ./VERSION file
+if [[ -z ${VERSION:-} ]]; then
+  VERSION="$(cat VERSION 2>/dev/null || true)"
+  VERSION="${VERSION:-dev}"
+fi
+VERSION="${VERSION#v}"
+
 RELENG="${RELENG:-/usr/share/archiso/configs/releng}"
 WORK=./work
 OUT=./out
@@ -47,6 +53,17 @@ sort -u -o "$PROFILE/packages.x86_64" "$PROFILE/packages.x86_64"
 
 echo "==> Overlaying Verity files…"
 cp -a overlay/airootfs/. "$PROFILE/airootfs/"
+
+echo "==> Syncing version $VERSION into the live system…"
+for f in "$PROFILE/airootfs/etc/os-release" \
+         "$PROFILE/airootfs/usr/share/verity/os-release"; do
+  if [[ -f $f ]]; then sed -i -e "s/^VERSION_ID=.*/VERSION_ID=$VERSION/" "$f"; fi
+done
+for f in "$PROFILE/airootfs/usr/local/bin/verity" \
+         "$PROFILE/airootfs/usr/local/bin/verity-install"; do
+  if [[ -f $f ]]; then sed -i -e "s/^VERSION=.*/VERSION=\"$VERSION\"/" "$f"; fi
+done
+
 cat >> "$PROFILE/profiledef.sh" <<'PERMS'
 
 file_permissions+=(

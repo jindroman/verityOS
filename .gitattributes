@@ -1,3 +1,6 @@
 # ISOs are published as GitHub Release assets, not stored in git.
 
 * text=auto eol=lf
+
+# binary assets (never touch line endings)
+*.mp3 binary

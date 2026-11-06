@@ -99,6 +99,7 @@ verity doctor
 verity rollback
 verity history
 verity clean
+verity sing                # plays the official Verity OS anthem 🎵
 ```
 
 The goal isn't to replace the underlying Linux package ecosystem.
@@ -266,7 +267,7 @@ New users should have Verity there to explain what everything means.
 
 ## 🚧 Current Status
 
-**Early development — v0.4.3. The ISO builds in CI, boots and installs in a VM (VirtualBox); not yet tested on real hardware.**
+**Early development — v0.4.4. The ISO builds in CI, boots and installs in a VM (VirtualBox); not yet tested on real hardware.**
 
 Currently being worked on:
 
@@ -340,6 +341,12 @@ The installer will:
 
 A log is written to `/tmp/verity-install.log`.
 
+### Troubleshooting
+
+* **Login bounces straight back to the greeter — the password seems broken.** The Hyprland desktop needs 3D acceleration: in VirtualBox go to *Settings → Display → Enable 3D Acceleration* and restart the VM. (The installer warns about this too; **Verity Desktop** (KDE) works without 3D.)
+* **After reboot the installer starts again.** The installer ejects the install medium before rebooting; if the machine still picks the ISO/USB, remove it when the screen goes black (in the VM: *Devices → Optical Drives → Remove disk from virtual drive*).
+* **`verity sing` plays nothing.** Check `verity doctor` for audio and make sure the VM has an audio controller (*Settings → Audio*).
+
 ### Writing the ISO to a USB stick
 
 ```bash
@@ -367,13 +374,14 @@ overlay/
 
 Don't commit `.iso` files with Git LFS and expect "Download ZIP" to include them — GitHub's ZIP only contains the tiny LFS *pointer* file. Publish ISOs as **GitHub Releases** assets (the workflow above does this for tags).
 
-### Known limitations (v0.4.3)
+### Known limitations (v0.4.4)
 
 * Boots and installs in a VM; not yet tested on real hardware
 * The installer creates a single **ext4** root partition — btrfs subvolumes, snapshots and `verity rollback` are **not set up yet** (rollback reports this and exits)
 * `verity ask` works offline via its built-in knowledge base (and can use Ollama/Claude if you set it up); the 3D orb and AI voice are **not implemented yet**
 * x86_64 only; no Secure Boot support; no disk encryption yet
 * Hyprland profile is minimal; KDE profile is stock Plasma
+* **Verity Hypr (Hyprland) needs 3D acceleration** — enable it in the VM (*Settings → Display → Enable 3D Acceleration*) or the desktop won't start and the login screen appears broken; Verity Desktop (KDE) works without it
 
 ---
 

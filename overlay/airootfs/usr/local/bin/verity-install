@@ -306,12 +306,27 @@ choose_disk() {
 }
 
 choose_profile() {
-  say; say "  ${B}Which edition?${N}"
-  info "${Y}1)${N} Verity Hypr      tiling desktop (Hyprland, needs real GPU / 3D)"
-  info "${Y}2)${N} Verity Desktop   KDE Plasma, works almost everywhere"
-  info "${Y}3)${N} Terminal only    no desktop"
-  local p; ask p "Edition" "2"
-  case "$p" in 1) PROFILE=hypr ;; 3) PROFILE=none ;; *) PROFILE=kde ;; esac
+  local p
+  while true; do
+    say; say "  ${B}Which edition?${N}"
+    info "${Y}1)${N} Verity Hypr      tiling desktop (Hyprland, needs real GPU / 3D)"
+    info "${Y}2)${N} Verity Desktop   KDE Plasma, works almost everywhere"
+    info "${Y}3)${N} Terminal only    no desktop"
+    ask p "Edition" "2"
+    case "$p" in 1) PROFILE=hypr ;; 3) PROFILE=none ;; *) PROFILE=kde ;; esac
+    # Hyprland needs working 3D. Inside a VM without it the desktop fails to
+    # start and the login screen silently loops back — which looks exactly
+    # like a broken password, so warn before it happens.
+    if [[ $PROFILE == hypr && $VM != none && $VM != wsl ]]; then
+      warn "You are installing inside a virtual machine ($VM)."
+      warn "Verity Hypr needs 3D acceleration — VirtualBox: Settings → Display"
+      warn "→ Enable 3D Acceleration (then restart the VM). Without it the"
+      warn "desktop may fail to start and loop back to the login screen."
+      confirm "Continue with Verity Hypr anyway?" && break
+      continue
+    fi
+    break
+  done
   AUTOLOGIN=0
   if [[ $PROFILE != none ]]; then
     confirm "Skip the login screen (log in automatically)?" && AUTOLOGIN=1 || AUTOLOGIN=0
@@ -539,6 +554,11 @@ EOF
   for f in verity verityfetch verity-ask verity-setup-desktop; do
     [[ -f /usr/local/bin/$f ]] && install -Dm755 "/usr/local/bin/$f" "$MNT/usr/local/bin/$f"
   done
+  # Verity assets for the installed system: ASCII logo (verityfetch) and the
+  # anthem (verity sing) — without these the commands come up empty-handed
+  for f in logo.txt its-me-verity.mp3; do
+    [[ -f /usr/share/verity/$f ]] && install -Dm644 "/usr/share/verity/$f" "$MNT/usr/share/verity/$f"
+  done
   ok "System configured"
 }
 
@@ -601,19 +621,86 @@ GRUBCFG
 do_finish() {
   step 7 "Finishing up"
   if (( DRY )); then info "[dry-run] unmount, eject, reboot"; return 0; fi
+
+  # the new system must have a boot menu before we tear anything down
+  local grub_ok=1
+  if [[ ! -s $MNT/boot/grub/grub.cfg ]]; then
+    grub_ok=0
+    warn "No boot menu at $MNT/boot/grub/grub.cfg — installation may be incomplete (see $LOG)"
+  fi
+
   rm -rf "$MNT"/var/cache/pacman/pkg/* 2>/dev/null
   sync
   umount -R "$MNT" >>"$LOG" 2>&1 || warn "Could not unmount cleanly."
 
-  local src; src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
-  [[ $src == /dev/sr* ]] && eject "$src" 2>/dev/null || true
+  # The live system runs from the very medium we are about to eject — page
+  # the tools needed afterwards into RAM first, or they vanish mid-reboot.
+  local tool bin
+  for tool in date sleep blockdev systemctl reboot; do
+    bin=$(command -v "$tool" 2>/dev/null || true)
+    [[ -n $bin ]] && cat "$bin" >/dev/null 2>&1 || true
+  done
+  systemctl --version >/dev/null 2>&1 || true
+  reboot --version >/dev/null 2>&1 || true
 
   say
   say "  ${G}${B}Verity OS is installed.${N}  (took $(fmt_time $(( SECONDS - START ))))"
+  say "  ${B}Log in as${N} ${B}$USERNAME${N} with the password you chose above."
   say
-  say "  ${B}Remove the installation USB stick or ISO now${N}, otherwise the computer"
-  say "  may boot the installer again instead of your new system."
-  (( UEFI )) || say "  ${D}(BIOS mode: removing the install media is required.)${N}"
+
+  # Eject the install medium. The live ISO ships no `eject` binary, so fall
+  # back to a CDROMEJECT ioctl through python — without this a BIOS machine
+  # boots straight back into the installer.
+  local src; src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+  if [[ $src == /dev/sr* ]]; then
+    local py="" method="" i key="" gone=0
+    if command -v eject >/dev/null 2>&1; then
+      method=eject
+    else
+      py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+      [[ -n $py ]] && method=python
+    fi
+    if [[ -n $method ]]; then
+      info "Ejecting the install medium so the machine boots your new system…"
+      for i in 1 2 3 4 5; do
+        if [[ $method == eject ]]; then
+          eject "$src" 2>/dev/null || true
+        else
+          "$py" - "$src" 2>/dev/null <<'PYEOF' || true
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+fcntl.ioctl(fd, 0x5321, 0)   # CDROMEJECT
+os.close(fd)
+PYEOF
+        fi
+        # an empty optical drive reports size 0 — that means "medium gone"
+        [[ $(blockdev --getsize64 "$src" 2>/dev/null || echo 1) -eq 0 ]] && { gone=1; break; }
+        (( i == 3 )) && warn "The medium is still inside — press q to reboot anyway…"
+        # wait up to a second per round; any other key just keeps waiting
+        read -rsn1 -t 1 key && [[ $key == q ]] && break
+      done
+    fi
+    if (( gone )); then
+      ok "Install medium ejected — the machine will boot your new system"
+    else
+      warn "Could not eject the install medium automatically."
+      say "  ${B}Remove the installation USB stick or ISO now${N}, otherwise the computer"
+      say "  may boot the installer again instead of your new system."
+      (( UEFI )) || say "  ${D}(BIOS mode: removing the install media is required.)${N}"
+    fi
+  else
+    [[ -n $src ]] && info "Install medium: $src"
+    say "  ${B}Remove the installation USB stick or ISO now${N}, otherwise the computer"
+    say "  may boot the installer again instead of your new system."
+    (( UEFI )) || say "  ${D}(BIOS mode: removing the install media is required.)${N}"
+  fi
+
+  if (( ! grub_ok )); then
+    say
+    confirm "The new system has no boot menu — reboot anyway?" \
+      || { say "  ${D}Staying in the installer; reboot manually when you are ready.${N}"; return 0; }
+  fi
+
   say
   read -rp "  Press Enter to reboot... " _ || true
   systemctl reboot 2>/dev/null || reboot

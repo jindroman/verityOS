@@ -47,6 +47,18 @@ if [[ -d "$PROFILE/syslinux" && -f branding/splash.png ]]; then
   cp branding/splash.png "$PROFILE/syslinux/splash.png"
 fi
 
+# syslinux menu colors: plain dark + yellow accent (drop the blue "AI" look)
+if [[ -f "$PROFILE/syslinux/archiso_head.cfg" ]]; then
+  sed -i \
+    -e 's/^MENU COLOR border .*/MENU COLOR border       37;40   #40ffffff #a0000000 std/' \
+    -e 's/^MENU COLOR title .*/MENU COLOR title        1;33;40 #90ffd21a #a0000000 std/' \
+    -e 's/^MENU COLOR sel .*/MENU COLOR sel          0;30;43 #e0000000 #e0ffd21a all/' \
+    -e 's/^MENU COLOR unsel .*/MENU COLOR unsel        37;40   #50ffffff #a0000000 std/' \
+    -e 's/^MENU COLOR timeout .*/MENU COLOR timeout      1;33;40 #90ffd21a #00000000 std/' \
+    -e 's/^MENU COLOR tabmsg .*/MENU COLOR tabmsg       33;40   #90ffd21a #00000000 std/' \
+    "$PROFILE/syslinux/archiso_head.cfg"
+fi
+
 echo "==> Adding packages…"
 grep -vE '^\s*(#|$)' overlay/packages.verity >> "$PROFILE/packages.x86_64"
 sort -u -o "$PROFILE/packages.x86_64" "$PROFILE/packages.x86_64"

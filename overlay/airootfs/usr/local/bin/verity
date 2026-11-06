@@ -162,6 +162,41 @@ cmd_doctor() {
        echo "${D}   Not sure what that means? Ask the AI helper:  verity doctor | verity ask \"explain this\"${N}"; fi
 }
 
+SONG=/usr/share/verity/its-me-verity.mp3
+
+cmd_sing() {
+  if [[ ! -r $SONG ]]; then
+    bad "the anthem isn't on this system ($SONG)"
+    echo "  It ships with Verity OS — a fresh install has it."
+    exit 1
+  fi
+  local player="" p
+  for p in mpv ffplay cvlc mplayer pw-play paplay; do
+    if command -v "$p" >/dev/null 2>&1; then player="$p"; break; fi
+  done
+  if [[ -z $player ]]; then
+    say "no player found — install one first:  sudo verity install mpv"
+    exit 1
+  fi
+  say "now playing: ${D}It's me, It's Verity — Horror Skunx${N}"
+  echo
+  local rc=0
+  case "$player" in
+    mpv)     mpv --no-video --really-quiet "$SONG" || rc=$? ;;
+    ffplay)  ffplay -nodisp -autoexit "$SONG" >/dev/null 2>&1 || rc=$? ;;
+    cvlc)    cvlc --play-and-exit --quiet "$SONG" >/dev/null 2>&1 || rc=$? ;;
+    mplayer) mplayer -really-quiet "$SONG" || rc=$? ;;
+    pw-play) pw-play "$SONG" || rc=$? ;;
+    paplay)  paplay "$SONG" || rc=$? ;;
+  esac
+  echo
+  if (( rc == 0 )); then
+    ok "♪ that's the official Verity OS anthem"
+  else
+    bad "playback failed — no audio device? (try: verity doctor)"
+  fi
+}
+
 cmd_ask() {
   if command -v verity-ask >/dev/null 2>&1; then
     exec verity-ask "$@"
@@ -182,6 +217,7 @@ ${Y}Verity OS${N} — package & system helper  (v$VERSION)
   sudo verity clean              clear package cache, offer to remove orphans
   sudo verity rollback           restore a snapshot (needs btrfs + snapper — not set up yet)
   verity doctor                  check kernel, network, audio, GPU, services…
+  verity sing                    play the official Verity OS anthem
   verity ask "<question>"        ask the Verity AI helper (works offline; smarter: verity ask --install-ai)
 
 Verity is a thin layer on top of pacman — pacman still works as normal.
@@ -197,6 +233,7 @@ case "$CMD" in
   clean)          cmd_clean "$@" ;;
   rollback)       cmd_rollback "$@" ;;
   doctor)         cmd_doctor ;;
+  sing|song)      cmd_sing "$@" ;;
   ask|ai)         cmd_ask "$@" ;;
   version|-v|--version) echo "verity $VERSION" ;;
   help|-h|--help) cmd_help ;;

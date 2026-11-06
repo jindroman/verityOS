@@ -1,58 +1,50 @@
 #!/usr/bin/env python3
-"""Generate Verity OS boot art from branding/logo-source.png (the smiley):
+"""Generate Verity OS boot art: plain dark backgrounds, yellow accent only.
 
   splash.png           640x480   ISO boot menu (BIOS syslinux)
   grub-background.png  1920x1080 GRUB menu on the installed system
-  logo.png             880x300   general purpose logo
+  logo.png             880x300   typographic "verity OS" wordmark
 
-Needs Pillow + numpy. Uses the Poppins font if present (falls back to DejaVu).
+No smiley, no tagline, no artwork: just a near-black background. The yellow
+accent lives in the menu colors (GRUB_COLOR_HIGHLIGHT, syslinux MENU COLOR),
+not in the image. Needs Pillow + numpy.
 """
 import os
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "logo-source.png")
+WHITE, YELLOW, INK = (240, 243, 250), (255, 210, 26), (9, 12, 20)
 SS = 3                                              # supersampling for text
-INK, WHITE, GREY = (9, 12, 20), (240, 243, 250), (150, 158, 178)
 
 
 def font(size, weight="Bold"):
-    for p in (f"/usr/share/fonts/truetype/google-fonts/Poppins-{weight}.ttf",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+    for p in (
+        f"/usr/share/fonts/truetype/google-fonts/Poppins-{weight}.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "C:/Windows/Fonts/seguibl.ttf" if weight == "Bold" else "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if weight == "Bold" else "C:/Windows/Fonts/arial.ttf",
+    ):
         if os.path.exists(p):
             return ImageFont.truetype(p, size)
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
-def load_logo():
-    """The smiley, cropped to its circle, plus its main yellow."""
-    im = Image.open(SRC).convert("RGBA")
-    im = im.crop(im.getchannel("A").getbbox())
-    a = np.array(im)
-    solid = a[(a[..., 3] == 255) & (a[..., 0] > 240) & (a[..., 2] < 90)]
-    yellow = tuple(int(v) for v in np.median(solid[:, :3], axis=0)) if len(solid) else (255, 214, 0)
-    return im, yellow
-
-
-def logo_at(size):
-    im, _ = load_logo()
-    out = im.resize((size, size), Image.LANCZOS)
-    return out.filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=2)) if size > im.width else out
-
-
-def vgradient(size, top, bottom):
+def dark(size, top=(10, 12, 17), bottom=(15, 18, 26), vignette=0.10):
+    """Near-black vertical gradient with a barely visible vignette - no artwork."""
     w, h = size
     col = np.linspace(0, 1, h)[:, None, None]
-    arr = (np.array(top) * (1 - col) + np.array(bottom) * col).astype(np.uint8)
-    return Image.fromarray(np.repeat(arr, w, axis=1), "RGB")
-
-
-def glow(canvas, cx, cy, radius, color, strength=0.35):
-    layer = Image.new("L", canvas.size, 0)
-    ImageDraw.Draw(layer).ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=255)
-    layer = layer.filter(ImageFilter.GaussianBlur(radius * 0.55)).point(lambda v: int(v * strength))
-    canvas.paste(Image.new("RGB", canvas.size, color), (0, 0), layer)
+    arr = (np.array(top) * (1 - col) + np.array(bottom) * col).astype(np.float32)
+    arr = np.repeat(arr, w, axis=1)
+    if vignette > 0:
+        yy, xx = np.mgrid[0:h, 0:w]
+        d = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2)
+        fall = 1.0 - vignette * np.clip(d - 0.6, 0, None)
+        arr *= fall[..., None]
+    return Image.fromarray(arr.astype(np.uint8), "RGB")
 
 
 def text_layer(canvas_size, items):
@@ -82,55 +74,30 @@ def wordmark(x, y, size, yellow):
     return draw, tw + gap + pw
 
 
-def paste_text(img, items):
-    layer = text_layer(img.size, items)
-    img.paste(layer, (0, 0), layer)
-
-
 def splash(path):
-    _, Y = load_logo()
-    img = vgradient((640, 480), (10, 13, 22), (20, 26, 42))
-    glow(img, 76, 82, 62, Y, 0.28)
-    mark = logo_at(104)
-    img.paste(mark, (24, 30), mark)
-    wm, _ = wordmark(150, 36, 54, Y)
-    tag = lambda d: d.text((154 * SS, 108 * SS), "Simple. Honest. AI built in.", font=font(15 * SS, "Regular"), fill=GREY)
-    foot = lambda d: d.text((40 * SS, 452 * SS), "Verity OS", font=font(11 * SS, "Regular"), fill=(88, 96, 116))
-    paste_text(img, [wm, tag, foot])
-    ImageDraw.Draw(img).line([(40, 165), (600, 165)], fill=(40, 48, 68), width=1)
+    """Plain dark plate for the ISO boot menu - the menu text sits on top of it."""
+    img = dark((640, 480))
     img.save(path, optimize=True)
     print("wrote", path, img.size)
 
 
 def grub_background(path):
-    """Logo in the lower-middle: GRUB draws its menu in the upper part of the screen."""
-    _, Y = load_logo()
-    W, H = 1920, 1080
-    img = vgradient((W, H), (8, 10, 18), (22, 28, 46))
-    cx, cy = W // 2, 690
-    glow(img, cx, cy, 230, Y, 0.30)
-    mark = logo_at(300)
-    img.paste(mark, (cx - 150, cy - 150), mark)
-    size = 96
-    tmp = ImageDraw.Draw(Image.new("RGB", (4, 4)))
-    tw = tmp.textlength("verity", font=font(size * SS, "Bold")) / SS
-    total = tw + size * 0.30 + size * 0.98
-    wm, _ = wordmark(cx - total / 2, cy + 190, size, Y)
-    tag = lambda d: d.text((cx * SS - tmp.textlength("Simple. Honest. AI built in.", font=font(26 * SS, "Regular")) / 2,
-                            (cy + 320) * SS), "Simple. Honest. AI built in.", font=font(26 * SS, "Regular"), fill=GREY)
-    paste_text(img, [wm, tag])
+    """Plain dark plate for the installed system's GRUB menu."""
+    img = dark((1920, 1080), top=(9, 11, 16), bottom=(14, 16, 23))
     img.save(path, optimize=True)
     print("wrote", path, img.size)
 
 
 def logo_png(path):
-    _, Y = load_logo()
-    img = vgradient((880, 300), (10, 13, 22), (20, 26, 42))
-    glow(img, 150, 150, 120, Y, 0.28)
-    mark = logo_at(200)
-    img.paste(mark, (50, 50), mark)
-    wm, _ = wordmark(285, 85, 100, Y)
-    paste_text(img, [wm])
+    """Typographic wordmark only - no smiley, no tagline."""
+    img = dark((880, 300))
+    size = 100
+    tmp = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+    tw = tmp.textlength("verity", font=font(size * SS, "Bold")) / SS
+    total = tw + size * 0.30 + size * 0.98
+    wm, _ = wordmark((880 - total) / 2, (300 - size * 0.9) / 2, size, YELLOW)
+    layer = text_layer(img.size, [wm])
+    img.paste(layer, (0, 0), layer)
     img.save(path, optimize=True)
     print("wrote", path, img.size)
 

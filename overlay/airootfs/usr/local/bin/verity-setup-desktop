@@ -25,7 +25,7 @@ case "$PROFILE" in
 esac
 
 COMMON=(sddm networkmanager mesa xorg-xwayland pipewire pipewire-pulse wireplumber
-        xdg-user-dirs noto-fonts ttf-dejavu qt5-wayland qt6-wayland python)
+        xdg-user-dirs noto-fonts ttf-dejavu qt5-wayland qt6-wayland python mpv)
 HYPR=(hyprland kitty waybar wofi thunar xdg-desktop-portal-hyprland hyprpolkitagent)
 KDE=(plasma-meta konsole dolphin kate)
 
@@ -151,7 +151,7 @@ mkdir -p /etc/sddm.conf.d
 mkdir -p /var/lib/sddm
 cat > /var/lib/sddm/state.conf <<EOF
 [Last]
-Session=$SESSION_PATH
+Session=$SESSION_FILE
 User=$USERNAME
 EOF
 chown -R sddm:sddm /var/lib/sddm 2>/dev/null || true

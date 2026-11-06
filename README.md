@@ -331,7 +331,7 @@ verity-install --dry-run  # walk the menus, change nothing, print the commands
 The installer will:
 
 1. Check boot mode (UEFI/BIOS) and internet (with a Wi-Fi fallback)
-2. Let you pick a disk (the live USB is hidden) and make you type its name to confirm
+2. Let you pick a disk (the live USB is hidden; disks under 12 GB are refused) and make you type its name to confirm — the summary shows how much storage the chosen edition needs
 3. Let you choose **Verity Hypr**, **Verity Desktop** (KDE) or **Terminal only**
 4. Ask for keymap, hostname, time zone, username and password
 5. Partition (GPT): 1 GiB FAT32 boot (UEFI) or bios_grub (BIOS), rest ext4 root

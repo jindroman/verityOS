@@ -648,33 +648,33 @@ do_finish() {
   say "  ${B}Log in as${N} ${B}$USERNAME${N} with the password you chose above."
   say
 
-  # Eject the install medium. The live ISO ships no `eject` binary, so fall
-  # back to a CDROMEJECT ioctl through python — without this a BIOS machine
-  # boots straight back into the installer.
+  # Eject the install medium — a BIOS machine otherwise boots straight back
+  # into the installer. Plain `eject` refuses while /run/archiso/bootmnt is
+  # mounted (that IS the running live system: "target is busy"), so pass -m
+  # to skip the unmount; if that fails, fall back to a CDROMEJECT ioctl
+  # through python. An empty optical drive reports 0 sectors in sysfs —
+  # blockdev, by contrast, errors out on an empty drive, which must not be
+  # read as "medium still present".
   local src; src=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
   if [[ $src == /dev/sr* ]]; then
-    local py="" method="" i key="" gone=0
-    if command -v eject >/dev/null 2>&1; then
-      method=eject
-    else
-      py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
-      [[ -n $py ]] && method=python
-    fi
-    if [[ -n $method ]]; then
+    local py="" have_eject=0 i key="" gone=0
+    command -v eject >/dev/null 2>&1 && have_eject=1
+    py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+    if (( have_eject )) || [[ -n $py ]]; then
       info "Ejecting the install medium so the machine boots your new system…"
       for i in 1 2 3 4 5; do
-        if [[ $method == eject ]]; then
-          eject "$src" 2>/dev/null || true
-        else
+        (( have_eject )) && eject -m "$src" 2>/dev/null || true
+        # an empty optical drive reports 0 sectors — that means "medium gone"
+        [[ $(cat "/sys/block/${src#/dev/}/size" 2>/dev/null || echo 1) == 0 ]] && { gone=1; break; }
+        if [[ -n $py ]]; then
           "$py" - "$src" 2>/dev/null <<'PYEOF' || true
 import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
 fcntl.ioctl(fd, 0x5321, 0)   # CDROMEJECT
 os.close(fd)
 PYEOF
+          [[ $(cat "/sys/block/${src#/dev/}/size" 2>/dev/null || echo 1) == 0 ]] && { gone=1; break; }
         fi
-        # an empty optical drive reports size 0 — that means "medium gone"
-        [[ $(blockdev --getsize64 "$src" 2>/dev/null || echo 1) -eq 0 ]] && { gone=1; break; }
         (( i == 3 )) && warn "The medium is still inside — press q to reboot anyway…"
         # wait up to a second per round; any other key just keeps waiting
         read -rsn1 -t 1 key && [[ $key == q ]] && break

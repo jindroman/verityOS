@@ -51,13 +51,17 @@ pacman -S --needed --noconfirm "${PKGS[@]}"
 [[ -f $SESSION_PATH ]] || log "WARNING: $SESSION_PATH not found; check the package installed correctly"
 
 # ---- Hyprland starter config -------------------------------------------------
+# Hyprland (>= 0.57) loads ~/.config/hypr/hyprland.lua by default; the legacy
+# .conf format is ignored unless passed with --config, and this build's conf
+# parser rejects even the old starter file. The lua template ships at
+# /usr/share/verity/hyprland.lua (copied in by verity-install).
 install_hypr_config() {
   local dest="$1" src
-  [[ -f "$dest/hyprland.conf" ]] && return 0
+  [[ -f "$dest/hyprland.lua" ]] && return 0
   mkdir -p "$dest"
-  src="$(find /usr/share/verity -name hyprland.conf 2>/dev/null | head -n1 || true)"
-  if [[ -n "$src" ]]; then
-    cp "$src" "$dest/hyprland.conf"
+  src="$(find /usr/share/verity -maxdepth 1 -name hyprland.lua 2>/dev/null | head -n1 || true)"
+  if [[ -z "$src" ]]; then
+    log "WARNING: /usr/share/verity/hyprland.lua not found; Hyprland will generate a default config on first start"
     return 0
   fi
 
@@ -68,67 +72,30 @@ install_hypr_config() {
     [[ $layout == uk ]] && layout="gb"
   fi
 
-  cat > "$dest/hyprland.conf" <<EOF
-# Verity Hypr - starter config (edit freely)
-monitor = , preferred, auto, 1
-
-\$terminal = kitty
-\$files    = thunar
-\$menu     = wofi --show drun
-\$mod      = SUPER
-
-exec-once = waybar
-exec-once = systemctl --user start hyprpolkitagent
-
-input {
-    kb_layout = $layout
-    follow_mouse = 1
-    touchpad { natural_scroll = true }
+  cp "$src" "$dest/hyprland.lua"
+  sed -i -E "s/(kb_layout[[:space:]]*=[[:space:]]*)\"us\"/\1\"$layout\"/" "$dest/hyprland.lua"
 }
 
-general {
-    gaps_in = 5
-    gaps_out = 10
-    border_size = 2
-    col.active_border = rgba(ffd21aee)
-    col.inactive_border = rgba(333333aa)
-    layout = dwindle
-}
-
-decoration { rounding = 8 }
-
-bind = \$mod, Return, exec, \$terminal
-bind = \$mod, D, exec, \$menu
-bind = \$mod, E, exec, \$files
-bind = \$mod, Q, killactive
-bind = \$mod, F, fullscreen
-bind = \$mod, V, togglefloating
-bind = \$mod SHIFT, M, exit
-
-bind = \$mod, left,  movefocus, l
-bind = \$mod, right, movefocus, r
-bind = \$mod, up,    movefocus, u
-bind = \$mod, down,  movefocus, d
-
-bind = \$mod, 1, workspace, 1
-bind = \$mod, 2, workspace, 2
-bind = \$mod, 3, workspace, 3
-bind = \$mod, 4, workspace, 4
-bind = \$mod SHIFT, 1, movetoworkspace, 1
-bind = \$mod SHIFT, 2, movetoworkspace, 2
-bind = \$mod SHIFT, 3, movetoworkspace, 3
-bind = \$mod SHIFT, 4, movetoworkspace, 4
-
-bindm = \$mod, mouse:272, movewindow
-bindm = \$mod, mouse:273, resizewindow
-EOF
+# ---- waybar theme ------------------------------------------------------------
+install_waybar_config() {
+  local dest="$1"
+  [[ -f "$dest/config.jsonc" ]] && return 0
+  mkdir -p "$dest"
+  if [[ -f /usr/share/verity/waybar/config.jsonc ]]; then
+    cp /usr/share/verity/waybar/config.jsonc "$dest/config.jsonc"
+  fi
+  if [[ -f /usr/share/verity/waybar/style.css ]]; then
+    cp /usr/share/verity/waybar/style.css "$dest/style.css"
+  fi
 }
 
 if [[ $PROFILE == hypr ]]; then
   log "writing Hyprland config"
   install_hypr_config /etc/skel/.config/hypr
+  install_waybar_config /etc/skel/.config/waybar
   HOME_DIR="$(getent passwd "$USERNAME" | cut -d: -f6)"
   install_hypr_config "$HOME_DIR/.config/hypr"
+  install_waybar_config "$HOME_DIR/.config/waybar"
   chown -R "$USERNAME:$(id -gn "$USERNAME")" "$HOME_DIR/.config"
 fi
 

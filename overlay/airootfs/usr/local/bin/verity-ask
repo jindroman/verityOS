@@ -305,12 +305,16 @@ topic("Bluetooth", "bluetooth, bluetoth, pair, pairing, wireless headphones, blu
 """)
 
 topic("Screen resolution / display", "resolution, screen resolution, display, monitor, screen size, scale, scaling, too small, too big, refresh rate", """
-    Hyprland: list monitors, then edit the monitor line in ~/.config/hypr/hyprland.conf:
+    Hyprland: list monitors, then edit the hl.monitor block in ~/.config/hypr/hyprland.lua:
     ```bash
     hyprctl monitors
     ```
-    ```text
-    monitor = HDMI-A-1, 1920x1080@60, 0x0, 1
+    ```lua hl.monitor({
+        output   = "HDMI-A-1",   -- name from hyprctl monitors, "" = all
+        mode     = "1920x1080@60",
+        position = "0x0",
+        scale    = "auto",
+    })
     ```
     KDE Plasma: System Settings > Display & Monitor.
     In VirtualBox the resolution only adjusts if guest tools run - ask me about "virtualbox".
@@ -325,7 +329,7 @@ topic("Keyboard layout", "keyboard, keyboard layout, keymap, wrong keys, czech k
     sudo localectl set-keymap cz-qwertz
     sudo localectl set-x11-keymap cz
     ```
-    Hyprland: set  kb_layout = cz  in the input { } block of ~/.config/hypr/hyprland.conf.
+    Hyprland: set  kb_layout = "cz"  in the hl.config({ input = ... }) block of ~/.config/hypr/hyprland.lua.
     KDE: System Settings > Keyboard.
 """)
 
@@ -623,7 +627,7 @@ topic("Hyprland shortcuts (Verity Hypr)", "hyprland shortcuts, shortcuts, keybin
       SUPER+F          fullscreen          SUPER+V     floating on/off
       SUPER+arrows     move focus          SUPER+1..4  workspaces
       SUPER+Shift+M    exit Hyprland
-    Change them in ~/.config/hypr/hyprland.conf.
+    Change them in ~/.config/hypr/hyprland.lua.
 """)
 
 topic("Take a screenshot", "screenshot, screen shot, capture screen, print screen, snip, screen capture", """
